@@ -760,6 +760,7 @@ def run_hamer_from_gvhmr_keypoints(
     rescale_factor: float,
     min_conf: float,
     force: bool,
+    verbose: bool = False,
 ) -> Path:
     import cv2
     import numpy as np
@@ -811,17 +812,18 @@ def run_hamer_from_gvhmr_keypoints(
             boxes_np = np.asarray(boxes, dtype=np.float32)
             right_np = np.asarray(right, dtype=np.float32)
 
-            debug_img = img_cv2.copy()
-            for box, right_flag in zip(boxes_np, right_np):
-                color = (0, 255, 0) if int(right_flag) == 1 else (255, 0, 0)
-                cv2.rectangle(
-                    debug_img,
-                    (int(box[0]), int(box[1])),
-                    (int(box[2]), int(box[3])),
-                    color,
-                    2,
-                )
-            cv2.imwrite(str(out_dir / f"{frame_path.stem}_bbox.jpg"), debug_img)
+            if verbose:
+                debug_img = img_cv2.copy()
+                for box, right_flag in zip(boxes_np, right_np):
+                    color = (0, 255, 0) if int(right_flag) == 1 else (255, 0, 0)
+                    cv2.rectangle(
+                        debug_img,
+                        (int(box[0]), int(box[1])),
+                        (int(box[2]), int(box[3])),
+                        color,
+                        2,
+                    )
+                cv2.imwrite(str(out_dir / f"{frame_path.stem}_bbox.jpg"), debug_img)
 
             dataset = ViTDetDataset(
                 model_cfg,
@@ -1038,6 +1040,7 @@ def main() -> None:
         rescale_factor=args.hamer_rescale_factor,
         min_conf=args.hand_min_conf,
         force=args.force,
+        verbose=args.verbose,
     )
 
     merged_path = gvhmr_run.output_dir / "smplx_merged_hamer.pt"
