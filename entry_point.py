@@ -914,10 +914,11 @@ def infer_num_frames_from_smpl_params(params: dict[str, Any]) -> int:
 
 def ensure_hand_pose_tensor(params: dict[str, Any], key: str, num_frames: int, dtype: Any, torch_module: Any) -> Any:
     value = params.get(key)
-    if hasattr(value, "reshape") and hasattr(value, "shape") and int(value.shape[0]) == num_frames:
-        reshaped = value.reshape(num_frames, -1)
-        if int(reshaped.shape[1]) == 45:
-            return reshaped.clone()
+    if value is not None and hasattr(value, "reshape") and hasattr(value, "shape"):
+        try:
+            return value.reshape(num_frames, 45).clone().to(dtype=dtype)
+        except Exception:
+            print(f"[CAP] Warning: could not use GVHMR {key} (shape={tuple(value.shape)}) as fallback. Using zeros.")
     return torch_module.zeros((num_frames, 45), dtype=dtype)
 
 
