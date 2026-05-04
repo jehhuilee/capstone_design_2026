@@ -899,7 +899,16 @@ def load_hamer_hand_detections(hamer_out_dir: Path, num_frames: int) -> dict[str
             data = np.load(npz_path, allow_pickle=True)
             side = "right" if int(np.asarray(data["is_right"]).reshape(-1)[0]) == 1 else "left"
             mano_params = data["mano_params"].item()
-            detections[side][frame_idx] = hamer_hand_pose_to_axis_angle(mano_params["hand_pose"])
+            pose = hamer_hand_pose_to_axis_angle(mano_params["hand_pose"])
+            if side == "left":
+                # HaMeR detects left hands by horizontally flipping the image and running
+                # the model in right-hand space.  The raw output is therefore right-hand
+                # MANO params.  SMPL-X left_hand_pose lives in a mirrored local frame, so
+                # we must convert: negate the y and z components of every joint axis-angle.
+                pose = pose.copy()
+                pose[1::3] *= -1
+                pose[2::3] *= -1
+            detections[side][frame_idx] = pose
         except Exception as exc:
             print(f"[CAP] Warning: failed to load {npz_path.name}: {exc}")
 
@@ -922,6 +931,31 @@ def ensure_hand_pose_tensor(params: dict[str, Any], key: str, num_frames: int, d
         except Exception:
             print(f"[CAP] Warning: could not use GVHMR {key} (shape={tuple(value.shape)}) as fallback. Using zeros.")
     return torch_module.zeros((num_frames, 45), dtype=dtype)
+
+
+def _smooth_hand_pose_temporal(pose: Any, sigma: float = 2.0) -> Any:
+    """Gaussian smooth hand pose tensor (T, 45) along the time axis."""
+    import torch
+    import torch.nn.functional as F
+    import numpy as np
+
+    try:
+        from scipy.ndimage._filters import _gaussian_kernel1d
+    except ImportError:
+        from scipy.ndimage.filters import _gaussian_kernel1d
+
+    T, D = pose.shape
+    if T < 3:
+        return pose
+    radius = int(4 * sigma + 0.5)
+    kernel = np.array(_gaussian_kernel1d(sigma=sigma, order=0, radius=radius), dtype=np.float32)
+    k = torch.from_numpy(kernel).to(pose.device).to(pose.dtype)
+    k = k[None, None].repeat(D, 1, 1)  # (D, 1, K)
+    rad = k.shape[-1] // 2
+    x = pose.T.unsqueeze(0)  # (1, D, T)
+    x = F.pad(x, (rad, rad), mode="replicate")
+    x = F.conv1d(x, k, groups=D)  # (1, D, T)
+    return x.squeeze(0).T  # (T, D)
 
 
 def merge_hamer_hands_into_gvhmr(
@@ -956,8 +990,8 @@ def merge_hamer_hands_into_gvhmr(
         for frame_idx, pose in detections["right"].items():
             right[frame_idx] = torch.from_numpy(pose).to(dtype=dtype)
 
-        params["left_hand_pose"] = left
-        params["right_hand_pose"] = right
+        params["left_hand_pose"] = _smooth_hand_pose_temporal(left)
+        params["right_hand_pose"] = _smooth_hand_pose_temporal(right)
 
     report = {
         "gvhmr_results": str(gvhmr_results),
