@@ -760,6 +760,7 @@ def run_hamer_from_gvhmr_keypoints(
     rescale_factor: float,
     min_conf: float,
     force: bool,
+    verbose: bool = False,
 ) -> Path:
     import cv2
     import numpy as np
@@ -811,17 +812,18 @@ def run_hamer_from_gvhmr_keypoints(
             boxes_np = np.asarray(boxes, dtype=np.float32)
             right_np = np.asarray(right, dtype=np.float32)
 
-            debug_img = img_cv2.copy()
-            for box, right_flag in zip(boxes_np, right_np):
-                color = (0, 255, 0) if int(right_flag) == 1 else (255, 0, 0)
-                cv2.rectangle(
-                    debug_img,
-                    (int(box[0]), int(box[1])),
-                    (int(box[2]), int(box[3])),
-                    color,
-                    2,
-                )
-            cv2.imwrite(str(out_dir / f"{frame_path.stem}_bbox.jpg"), debug_img)
+            if verbose:
+                debug_img = img_cv2.copy()
+                for box, right_flag in zip(boxes_np, right_np):
+                    color = (0, 255, 0) if int(right_flag) == 1 else (255, 0, 0)
+                    cv2.rectangle(
+                        debug_img,
+                        (int(box[0]), int(box[1])),
+                        (int(box[2]), int(box[3])),
+                        color,
+                        2,
+                    )
+                cv2.imwrite(str(out_dir / f"{frame_path.stem}_bbox.jpg"), debug_img)
 
             dataset = ViTDetDataset(
                 model_cfg,
@@ -914,10 +916,11 @@ def infer_num_frames_from_smpl_params(params: dict[str, Any]) -> int:
 
 def ensure_hand_pose_tensor(params: dict[str, Any], key: str, num_frames: int, dtype: Any, torch_module: Any) -> Any:
     value = params.get(key)
-    if hasattr(value, "reshape") and hasattr(value, "shape") and int(value.shape[0]) == num_frames:
-        reshaped = value.reshape(num_frames, -1)
-        if int(reshaped.shape[1]) == 45:
-            return reshaped.clone()
+    if value is not None and hasattr(value, "reshape") and hasattr(value, "shape"):
+        try:
+            return value.reshape(num_frames, 45).clone().to(dtype=dtype)
+        except Exception:
+            print(f"[CAP] Warning: could not use GVHMR {key} (shape={tuple(value.shape)}) as fallback. Using zeros.")
     return torch_module.zeros((num_frames, 45), dtype=dtype)
 
 
@@ -1037,6 +1040,7 @@ def main() -> None:
         rescale_factor=args.hamer_rescale_factor,
         min_conf=args.hand_min_conf,
         force=args.force,
+        verbose=args.verbose,
     )
 
     merged_path = gvhmr_run.output_dir / "smplx_merged_hamer.pt"
