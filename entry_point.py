@@ -663,32 +663,6 @@ def torch_load_file(torch_module: Any, path: Path, map_location: str = "cpu") ->
         return torch_module.load(path, map_location=map_location)
 
 
-def extract_video_frames(video_path: Path, frame_dir: Path, force: bool) -> int:
-    import cv2
-
-    existing = sorted(frame_dir.glob("*.jpg"))
-    if existing and not force:
-        return len(existing)
-
-    clear_files(frame_dir, ("*.jpg", "*.png"))
-    capture = cv2.VideoCapture(str(video_path))
-    if not capture.isOpened():
-        raise RuntimeError(f"Could not open video: {video_path}")
-
-    frame_idx = 0
-    while True:
-        ok, frame = capture.read()
-        if not ok:
-            break
-        cv2.imwrite(str(frame_dir / f"{frame_idx:04d}.jpg"), frame)
-        frame_idx += 1
-    capture.release()
-
-    if frame_idx == 0:
-        raise RuntimeError(f"No frames extracted from video: {video_path}")
-    return frame_idx
-
-
 def estimate_hand_boxes_from_coco17(
     keypoints: Any,
     width: int,
@@ -751,7 +725,7 @@ def ensure_hamer_on_path(hamer_root: Path) -> None:
 
 
 def run_hamer_from_gvhmr_keypoints(
-    frame_dir: Path,
+    video_path: Path,
     vitpose_path: Path,
     out_dir: Path,
     hamer_root: Path,
@@ -796,60 +770,73 @@ def run_hamer_from_gvhmr_keypoints(
         else:
             kp2d = np.asarray(kp2d)
 
-        frame_paths = sorted(frame_dir.glob("*.jpg"))
-        total = min(len(frame_paths), len(kp2d))
+        capture = cv2.VideoCapture(str(video_path))
+        if not capture.isOpened():
+            raise RuntimeError(f"Could not open video for HaMeR: {video_path}")
+
+        total = len(kp2d)
         saved = 0
+        read_frames = 0
 
-        for frame_idx, frame_path in tqdm(list(enumerate(frame_paths[:total])), desc="HaMeR"):
-            img_cv2 = cv2.imread(str(frame_path))
-            if img_cv2 is None:
-                continue
-            height, width = img_cv2.shape[:2]
-            boxes, right = estimate_hand_boxes_from_coco17(kp2d[frame_idx], width, height, min_conf)
-            if not boxes:
-                continue
+        try:
+            for frame_idx in tqdm(range(total), desc="HaMeR"):
+                ok, img_cv2 = capture.read()
+                if not ok or img_cv2 is None:
+                    break
+                read_frames += 1
 
-            boxes_np = np.asarray(boxes, dtype=np.float32)
-            right_np = np.asarray(right, dtype=np.float32)
+                frame_stem = f"{frame_idx:04d}"
+                height, width = img_cv2.shape[:2]
+                boxes, right = estimate_hand_boxes_from_coco17(kp2d[frame_idx], width, height, min_conf)
+                if not boxes:
+                    continue
 
-            if verbose:
-                debug_img = img_cv2.copy()
-                for box, right_flag in zip(boxes_np, right_np):
-                    color = (0, 255, 0) if int(right_flag) == 1 else (255, 0, 0)
-                    cv2.rectangle(
-                        debug_img,
-                        (int(box[0]), int(box[1])),
-                        (int(box[2]), int(box[3])),
-                        color,
-                        2,
-                    )
-                cv2.imwrite(str(out_dir / f"{frame_path.stem}_bbox.jpg"), debug_img)
+                boxes_np = np.asarray(boxes, dtype=np.float32)
+                right_np = np.asarray(right, dtype=np.float32)
 
-            dataset = ViTDetDataset(
-                model_cfg,
-                img_cv2,
-                boxes_np,
-                right_np,
-                rescale_factor=rescale_factor,
-            )
-            dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+                if verbose:
+                    debug_img = img_cv2.copy()
+                    for box, right_flag in zip(boxes_np, right_np):
+                        color = (0, 255, 0) if int(right_flag) == 1 else (255, 0, 0)
+                        cv2.rectangle(
+                            debug_img,
+                            (int(box[0]), int(box[1])),
+                            (int(box[2]), int(box[3])),
+                            color,
+                            2,
+                        )
+                    cv2.imwrite(str(out_dir / f"{frame_stem}_bbox.jpg"), debug_img)
 
-            for batch in dataloader:
-                batch = recursive_to(batch, device)
-                with torch.no_grad():
-                    out = model(batch)
+                dataset = ViTDetDataset(
+                    model_cfg,
+                    img_cv2,
+                    boxes_np,
+                    right_np,
+                    rescale_factor=rescale_factor,
+                )
+                dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
 
-                for n in range(batch["img"].shape[0]):
-                    person_id = int(batch["personid"][n])
-                    right_flag = int(float(batch["right"][n].detach().cpu().numpy()))
-                    np.savez(
-                        out_dir / f"{frame_path.stem}_{person_id}.npz",
-                        vertices=out["pred_vertices"][n].detach().cpu().numpy(),
-                        cam_t=out["pred_cam_t"][n].detach().cpu().numpy(),
-                        mano_params={k: v[n].detach().cpu().numpy() for k, v in out["pred_mano_params"].items()},
-                        is_right=right_flag,
-                    )
-                    saved += 1
+                for batch in dataloader:
+                    batch = recursive_to(batch, device)
+                    with torch.no_grad():
+                        out = model(batch)
+
+                    for n in range(batch["img"].shape[0]):
+                        person_id = int(batch["personid"][n])
+                        right_flag = int(float(batch["right"][n].detach().cpu().numpy()))
+                        np.savez(
+                            out_dir / f"{frame_stem}_{person_id}.npz",
+                            vertices=out["pred_vertices"][n].detach().cpu().numpy(),
+                            cam_t=out["pred_cam_t"][n].detach().cpu().numpy(),
+                            mano_params={k: v[n].detach().cpu().numpy() for k, v in out["pred_mano_params"].items()},
+                            is_right=right_flag,
+                        )
+                        saved += 1
+        finally:
+            capture.release()
+
+        if read_frames == 0:
+            raise RuntimeError(f"No frames read from video for HaMeR: {video_path}")
 
         if saved == 0:
             print("[CAP] Warning: HaMeR produced no hand detections. The merged file will keep GVHMR hand poses.")
@@ -1025,13 +1012,11 @@ def main() -> None:
         selection_ui=args.person_select_ui,
     )
 
-    frame_dir = gvhmr_run.output_dir / "hamer_frames"
     hamer_out_dir = gvhmr_run.output_dir / "hamer_out"
-    frame_count = extract_video_frames(gvhmr_run.video_path, frame_dir, args.force)
-    print(f"[CAP] Prepared {frame_count} frames for HaMeR: {frame_dir}")
+    print(f"[CAP] Streaming video frames for HaMeR: {gvhmr_run.video_path}")
 
     run_hamer_from_gvhmr_keypoints(
-        frame_dir=frame_dir,
+        video_path=gvhmr_run.video_path,
         vitpose_path=gvhmr_run.vitpose_path,
         out_dir=hamer_out_dir,
         hamer_root=hamer_root,
