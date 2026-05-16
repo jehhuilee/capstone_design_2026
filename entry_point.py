@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ class GVHMRRun:
     hmr4d_results: Path
     vitpose_path: Path
     video_path: Path
+    runtime_report: dict[str, Any]
 
 
 @dataclass
@@ -571,6 +573,12 @@ def run_gvhmr(
     ensure_project_on_path()
     from tools.demo import demo as gvhmr_demo
 
+    runtime_report: dict[str, Any] = {
+        "gvhmr_preprocess_sec": 0.0,
+        "gvhmr_predict_sec": 0.0,
+        "gvhmr_render_sec": 0.0,
+    }
+
     gvhmr_args = [
         "tools/demo/demo.py",
         "--video",
@@ -606,6 +614,7 @@ def run_gvhmr(
     )
 
     gvhmr_demo.Log.info("[CAP] Running GVHMR preprocess")
+    preprocess_tic = time.perf_counter()
     try:
         gvhmr_demo.run_preprocess(cfg)
     except Exception as exc:
@@ -614,6 +623,7 @@ def run_gvhmr(
         print(f"[CAP] Warning: moving-camera preprocess failed ({exc}). Falling back to static camera.")
         set_static_cam(cfg)
         gvhmr_demo.run_preprocess(cfg)
+    runtime_report["gvhmr_preprocess_sec"] = time.perf_counter() - preprocess_tic
     data = gvhmr_demo.load_data_dict(cfg)
 
     if not hmr4d_results.exists():
@@ -623,21 +633,26 @@ def run_gvhmr(
         model = gvhmr_demo.hydra.utils.instantiate(cfg.model, _recursive_=False)
         model.load_pretrained_model(cfg.ckpt_path)
         model = model.eval().cuda()
-        tic = gvhmr_demo.Log.sync_time()
+        predict_tic = gvhmr_demo.Log.sync_time()
         pred = model.predict(data, static_cam=cfg.static_cam)
         pred = gvhmr_demo.detach_to_cpu(pred)
         data_time = data["length"] / 30
-        gvhmr_demo.Log.info(f"[CAP] GVHMR elapsed: {gvhmr_demo.Log.sync_time() - tic:.2f}s for {data_time:.1f}s")
+        runtime_report["gvhmr_predict_sec"] = gvhmr_demo.Log.sync_time() - predict_tic
+        gvhmr_demo.Log.info(
+            f"[CAP] GVHMR elapsed: {runtime_report['gvhmr_predict_sec']:.2f}s for {data_time:.1f}s"
+        )
         gvhmr_demo.torch.save(pred, hmr4d_results)
     else:
         gvhmr_demo.Log.info(f"[CAP] Reusing GVHMR results: {hmr4d_results}")
 
     if render:
+        render_tic = time.perf_counter()
         gvhmr_demo.render_incam(cfg)
         gvhmr_demo.render_global(cfg)
         horiz = Path(paths.incam_global_horiz_video)
         if not horiz.exists():
             gvhmr_demo.merge_videos_horizontal([paths.incam_video, paths.global_video], paths.incam_global_horiz_video)
+        runtime_report["gvhmr_render_sec"] = time.perf_counter() - render_tic
 
     return GVHMRRun(
         cfg=cfg,
@@ -645,6 +660,7 @@ def run_gvhmr(
         hmr4d_results=hmr4d_results,
         vitpose_path=Path(paths.vitpose),
         video_path=Path(cfg.video_path),
+        runtime_report=runtime_report,
     )
 
 
@@ -735,7 +751,7 @@ def run_hamer_from_gvhmr_keypoints(
     min_conf: float,
     force: bool,
     verbose: bool = False,
-) -> Path:
+) -> tuple[Path, dict[str, Any]]:
     import cv2
     import numpy as np
     import torch
@@ -745,9 +761,10 @@ def run_hamer_from_gvhmr_keypoints(
 
     if out_dir.exists() and any(out_dir.glob("*.npz")) and not force:
         print(f"[CAP] Reusing HaMeR outputs: {out_dir}")
-        return out_dir
+        return out_dir, {"hamer_sec": 0.0, "hamer_saved_predictions": 0}
 
     clear_files(out_dir, ("*.npz", "*.jpg", "*.png", "*.obj"))
+    hamer_tic = time.perf_counter()
 
     with temporary_cwd(hamer_root):
         from hamer.configs import CACHE_DIR_HAMER
@@ -843,7 +860,10 @@ def run_hamer_from_gvhmr_keypoints(
         else:
             print(f"[CAP] Saved {saved} HaMeR hand predictions to {out_dir}")
 
-    return out_dir
+    return out_dir, {
+        "hamer_sec": time.perf_counter() - hamer_tic,
+        "hamer_saved_predictions": saved,
+    }
 
 
 def hamer_hand_pose_to_axis_angle(hand_pose: Any) -> "Any":
@@ -915,6 +935,7 @@ def merge_hamer_hands_into_gvhmr(
     gvhmr_results: Path,
     hamer_out_dir: Path,
     output_path: Path,
+    extra_meta: dict[str, Any] | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     import torch
 
@@ -954,6 +975,8 @@ def merge_hamer_hands_into_gvhmr(
         "left_hand_frames": len(detections["left"]),
         "right_hand_frames": len(detections["right"]),
     }
+    if extra_meta:
+        report.update(extra_meta)
     merged["cap_merge_meta"] = report
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -983,6 +1006,7 @@ def render_merged_result_video(gvhmr_run: GVHMRRun, merged_path: Path, force: bo
 
 
 def main() -> None:
+    total_tic = time.perf_counter()
     launch_cwd = Path.cwd()
     args = complete_interactive_args(parse_args())
     ensure_project_on_path()
@@ -1017,22 +1041,74 @@ def main() -> None:
 
     run_hamer_from_gvhmr_keypoints(
         video_path=gvhmr_run.video_path,
-        vitpose_path=gvhmr_run.vitpose_path,
-        out_dir=hamer_out_dir,
-        hamer_root=hamer_root,
-        checkpoint=hamer_checkpoint,
-        batch_size=args.hamer_batch_size,
-        rescale_factor=args.hamer_rescale_factor,
-        min_conf=args.hand_min_conf,
-        force=args.force,
-        verbose=args.verbose,
+        frame_extract_tic = time.perf_counter()
+        frame_count = extract_video_frames(gvhmr_run.video_path, frame_dir, args.force)
+        frame_extract_sec = time.perf_counter() - frame_extract_tic
+        print(f"[CAP] Prepared {frame_count} frames for HaMeR: {frame_dir}")
+
+        _, hamer_report = run_hamer_from_gvhmr_keypoints(
+            frame_dir=frame_dir,
+            vitpose_path=gvhmr_run.vitpose_path,
+            out_dir=hamer_out_dir,
+            hamer_root=hamer_root,
+            checkpoint=hamer_checkpoint,
+            batch_size=args.hamer_batch_size,
+            rescale_factor=args.hamer_rescale_factor,
+            min_conf=args.hand_min_conf,
+            force=args.force,
+            verbose=args.verbose,
     )
 
     merged_path = gvhmr_run.output_dir / "smplx_merged_hamer.pt"
-    merged_path, report = merge_hamer_hands_into_gvhmr(gvhmr_run.hmr4d_results, hamer_out_dir, merged_path)
+    render_result_sec = 0.0
+    total_elapsed_before_render = time.perf_counter() - total_tic
+    runtime_meta = {
+        **gvhmr_run.runtime_report,
+        "frame_extract_sec": frame_extract_sec,
+        **hamer_report,
+        "input_frames": frame_count,
+        "gvhmr_preprocess_fps": frame_count / gvhmr_run.runtime_report["gvhmr_preprocess_sec"]
+        if gvhmr_run.runtime_report["gvhmr_preprocess_sec"] > 0
+        else 0.0,
+        "gvhmr_predict_fps": frame_count / gvhmr_run.runtime_report["gvhmr_predict_sec"]
+        if gvhmr_run.runtime_report["gvhmr_predict_sec"] > 0
+        else 0.0,
+        "frame_extract_fps": frame_count / frame_extract_sec if frame_extract_sec > 0 else 0.0,
+        "hamer_fps": frame_count / hamer_report["hamer_sec"] if hamer_report["hamer_sec"] > 0 else 0.0,
+        "pipeline_sec_before_render": total_elapsed_before_render,
+    }
+    merged_path, report = merge_hamer_hands_into_gvhmr(
+        gvhmr_run.hmr4d_results,
+        hamer_out_dir,
+        merged_path,
+        extra_meta=runtime_meta,
+    )
     result_video = None
     if not args.skip_result_video:
+        render_result_tic = time.perf_counter()
         result_video = render_merged_result_video(gvhmr_run, merged_path, args.force)
+        render_result_sec = time.perf_counter() - render_result_tic
+        report["result_render_sec"] = render_result_sec
+        report["result_render_fps"] = frame_count / render_result_sec if render_result_sec > 0 else 0.0
+        report["pipeline_total_sec"] = time.perf_counter() - total_tic
+        report["pipeline_total_fps"] = frame_count / report["pipeline_total_sec"] if report["pipeline_total_sec"] > 0 else 0.0
+        merged_path, report = merge_hamer_hands_into_gvhmr(
+            gvhmr_run.hmr4d_results,
+            hamer_out_dir,
+            merged_path,
+            extra_meta=report,
+        )
+    else:
+        report["result_render_sec"] = 0.0
+        report["result_render_fps"] = 0.0
+        report["pipeline_total_sec"] = time.perf_counter() - total_tic
+        report["pipeline_total_fps"] = frame_count / report["pipeline_total_sec"] if report["pipeline_total_sec"] > 0 else 0.0
+        merged_path, report = merge_hamer_hands_into_gvhmr(
+            gvhmr_run.hmr4d_results,
+            hamer_out_dir,
+            merged_path,
+            extra_meta=report,
+        )
 
     print("[CAP] Done")
     print(f"[CAP] Merged SMPL-X params: {merged_path}")
@@ -1040,6 +1116,7 @@ def main() -> None:
         print(f"[CAP] Merged result video: {result_video}")
     print(f"[CAP] Left hand frames: {report['left_hand_frames']} / {report['num_frames']}")
     print(f"[CAP] Right hand frames: {report['right_hand_frames']} / {report['num_frames']}")
+    print(f"[CAP] Runtime total: {report['pipeline_total_sec']:.2f}s ({report['pipeline_total_fps']:.2f} frames/s)")
 
 
 if __name__ == "__main__":
