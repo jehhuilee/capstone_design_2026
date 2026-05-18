@@ -26,9 +26,9 @@ pip install -r requirements.txt
 
 실행 전 아래 파일들이 올바른 경로에 있어야 합니다.
 
-1.  **SMPL-X 모델**: [SMPL-X 공식 홈페이지](https://smpl-x.is.tue.mpg.de/)에서 모델 파일을 다운로드하여 `models/` 폴더에 넣어주세요.
-2.  **GVHMR 결과**: `hmr4d_results.pt` 파일이 루트 폴더에 필요합니다.
-3.  **HaMeR 프레임**: HaMeR에서 추출된 `.npz` 파일들이 지정된 경로(기본값: `data/hamer_out`)에 있어야 합니다.
+1.  **SMPL-H 모델**: [MANO 공식 홈페이지](https://mano.is.tue.mpg.de/)에서 모델 파일을 다운로드하여 `models/` 폴더에 넣어주세요.
+2.  **GVHMR 결과**: `hmr4d_results.pt` 파일이 `BASE_OUTPUT_DIR` 폴더에 들어가 있어야 합니다.
+3.  **HaMeR 프레임**: HaMeR에서 추출된 `.npz` 파일들이 지정된 경로(기본값: `BASE_OUTPUT_DIR/hamer_out`)에 있어야 합니다.
 
 ## 🚀 실행 방법 (Usage)
 
@@ -42,9 +42,7 @@ python view_motion.py
 ## 🏗 프로젝트 구조
 ```text
 gvhmr_smplx_visualizing/
-├── data/               # HaMeR .npz 데이터 저장소
-├── models/             # SMPL-X 모델 파일 (.npz, .pkl 등)
-├── main_vis.py         # 메인 시각화 실행 스크립트
+├── models/             # SMPL-H 모델 파일 (.npz, .pkl 등)
 ├── requirements.txt    # 의존성 패키지 목록
 └── README.md           # 프로젝트 문서
 ```

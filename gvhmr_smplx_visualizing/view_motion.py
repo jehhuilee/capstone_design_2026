@@ -1,5 +1,8 @@
-# -*- coding: utf-8 -*-  
+# -*- coding: utf-8 -*-
 from __future__ import print_function
+
+from hand_temporal_model import TemporalSmoother
+from hand_kalman_filter import HandPoseKalmanFilter
 
 import time
 import numpy as np
@@ -8,220 +11,365 @@ import open3d as o3d
 import smplx
 import os
 import cv2
+import pickle
 
 # --- 경로 및 설정 ---
-HAMER_PATH = "C:\\Users\\SeunghyunWoo\\Desktop\\HaMeR_output\\hamer\\frames_out"
-PT_PATH = "hmr4d_results.pt"
-MODEL_PATH = "models"
-PARAM_KEY = "smpl_params_global"
-GENDER = "neutral"
-FPS = 30
+BASE_OUTPUT_DIR = r""
+HAMER_PATH      = os.path.join(BASE_OUTPUT_DIR, "hamer_out")
+PT_PATH         = os.path.join(BASE_OUTPUT_DIR, "hmr4d_results.pt")
+MODEL_PATH      = "models"
+PARAM_KEY       = "smpl_params_global"
+GENDER          = "neutral"
+FPS             = 30
+
+TEMPORAL_MODEL_PATH = "hand_temporal_model.pth"
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+# ──────────────────────────────────────────────────────────
+# 데이터 로드
+# ──────────────────────────────────────────────────────────
+
 def load_motion(pt_path, param_key="smpl_params_global"):
-    data = torch.load(pt_path, map_location=device)
+    data   = torch.load(pt_path, map_location=device)
     params = data[param_key]
-    
     return {
-        "body_pose": params["body_pose"].float(),
-        "betas": params["betas"].float(),
+        "body_pose":     params["body_pose"].float(),
+        "betas":         params["betas"].float(),
         "global_orient": params["global_orient"].float(),
-        "transl": params["transl"].float(),
+        "transl":        params["transl"].float(),
     }
 
+
 def build_smpl_model(model_path, gender="neutral"):
-    # HaMeR는 보통 PCA가 아닌 Full Pose(45차원)를 주므로 use_pca=False 설정이 안전합니다.
-    model = smplx.create(
+    return smplx.create(
         model_path=model_path,
-        model_type="smplx",
+        model_type="smplh",
         gender=gender,
-        use_pca=False, 
+        use_pca=False,
+        num_left_hand_pca_comps=45,
+        num_right_hand_pca_comps=45,
+        flat_hand_mean=True,
         batch_size=1,
+        ext="pkl",
     ).to(device)
-    return model
+
 
 def load_hamer_hands(frame_idx):
-    """OpenCV를 사용하여 HaMeR의 3x3 행렬을 SMPL-X용 데이터로 변환"""
-    prefix = "{:04d}_".format(frame_idx)
-    hand_files = [f for f in os.listdir(HAMER_PATH) if f.startswith(prefix) and f.endswith(".npz")]
-    
+    prefix     = "{:04d}_".format(frame_idx)
+    hand_files = [
+        f for f in os.listdir(HAMER_PATH)
+        if f.startswith(prefix) and f.endswith(".npz")
+    ]
+
     l_hand, r_hand = None, None
-    
+    l_conf, r_conf = 0.0, 0.0
+
     for f in hand_files:
         try:
-            data = np.load(os.path.join(HAMER_PATH, f), allow_pickle=True)
-            is_right = data['is_right']
-            
-            # 1. HaMeR 데이터 추출 (보통 15, 3, 3 형태의 넘파이 배열)
-            hand_pose_matrix = data['mano_params'].item()['hand_pose']
-            
-            # 2. [핵심] 15개 관절 각각을 3x3 행렬 -> 3차원 벡터로 변환
+            data            = np.load(os.path.join(HAMER_PATH, f), allow_pickle=True)
+            is_right        = float(data["is_right"])
+            hand_pose_mat   = data["mano_params"].item()["hand_pose"]
+            conf            = float(data["keypoint_confidiences"]) if "keypoint_confidiences" in data else 1.0
+
             aa_list = []
             for j in range(15):
-                # cv2.Rodrigues는 (3,3) 행렬을 받아서 (3,1) 벡터와 야코비안을 반환합니다.
-                R = hand_pose_matrix[j]
-                aa, _ = cv2.Rodrigues(R)
-                aa_list.append(aa.flatten()) # (3,) 형태로 펴서 저장
-            
-            # 3. (15, 3) -> (1, 45) 형태의 텐서로 변환
-            hand_pose_final = torch.tensor(np.array(aa_list)).float().reshape(1, 45).to(device)
+                aa, _ = cv2.Rodrigues(hand_pose_mat[j])
+                aa    = aa.flatten()
+                if is_right == 0:           # 왼손 미러 보정
+                    aa[1] = -aa[1]
+                    aa[2] = -aa[2]
+                aa_list.append(aa)
+
+            pose = torch.tensor(np.array(aa_list)).float().reshape(1, 45).to(device)
 
             if is_right == 1:
-                r_hand = hand_pose_final
+                r_hand, r_conf = pose, conf
             else:
-                l_hand = hand_pose_final
-                
+                l_hand, l_conf = pose, conf
+
         except Exception as e:
             print(f"[WARN] {f} 로드 실패: {e}")
-            
-    return l_hand, r_hand
 
-def create_racket_mesh():
-    """간단한 라켓 메쉬 생성 (손잡이 + 헤드)"""
-    # 1. 손잡이 (Handle)
-    handle = o3d.geometry.TriangleMesh.create_cylinder(radius=0.015, height=0.4)
-    handle.paint_uniform_color([0.5, 0.3, 0.1]) # 갈색(나무)
-    
-    # 2. 헤드 (Head) - 원형 프레임
-    head = o3d.geometry.TriangleMesh.create_torus(torus_radius=0.15, tube_radius=0.01)
-    head.translate([0, 0.35, 0]) # 손잡이 위로 이동
-    head.paint_uniform_color([0.1, 0.1, 0.1]) # 검정색
-    
-    # 두 메쉬 합치기
-    racket = handle + head
-    racket.compute_vertex_normals()
-    return racket
+    return l_hand, r_hand, l_conf, r_conf
 
-def make_mesh_from_frame(model, body_pose, betas, global_orient, transl, left_hand_pose=None, right_hand_pose=None):
-    """배치 사이즈 1 고정 및 필수 포즈 명시적 전달"""
+
+# ──────────────────────────────────────────────────────────
+# SMPL-H 메쉬
+# ──────────────────────────────────────────────────────────
+
+def make_mesh_from_frame(model, body_pose, betas, global_orient, transl,
+                         left_hand_pose=None, right_hand_pose=None):
     with torch.no_grad():
-        # 모든 입력을 (1, N) 형태로 리셰이프 (안전장치)
-        b_pose = body_pose.reshape(1, -1)
-        beta   = betas.reshape(1, -1)
-        g_ori  = global_orient.reshape(1, -1)
-        trans  = transl.reshape(1, -1)
-
-        if left_hand_pose is None:
-            left_hand_pose = torch.zeros(1, 45).to(device)
-        if right_hand_pose is None:
-            right_hand_pose = torch.zeros(1, 45).to(device)
-
-        # SMPL-X 내부에서 Batch Size가 꼬이지 않도록 턱과 눈 포즈도 1개분(1, 3)으로 전달
-        zero_pose = torch.zeros(1, 3).to(device)
+        lh = (left_hand_pose  if left_hand_pose  is not None else torch.zeros(1, 45)).to(device)
+        rh = (right_hand_pose if right_hand_pose is not None else torch.zeros(1, 45)).to(device)
 
         output = model(
             betas=betas.reshape(1, -1),
             global_orient=global_orient.reshape(1, -1),
             body_pose=body_pose.reshape(1, -1),
             transl=transl.reshape(1, -1),
-            left_hand_pose=left_hand_pose,
-            right_hand_pose=right_hand_pose,
+            left_hand_pose=lh,
+            right_hand_pose=rh,
             return_verts=True,
-            return_full_pose=True # 관절 각도를 가져오기 위해 추가
         )
 
-    vertices = output.vertices[0].cpu().numpy()
-    faces = model.faces.astype(np.int32)
-    
-    # [핵심] 오른손 손목(Joint 21)의 위치와 회전 정보를 가져옵니다.
-    # SMPL-X 관절 인덱스: 21번이 오른손 손목입니다.
-    right_wrist_pos = output.joints[0, 21].cpu().numpy()
-    
-    return vertices, faces, right_wrist_pos
+    vertices      = output.vertices[0].cpu().numpy()
+    faces         = model.faces.astype(np.int32)
+    right_wrist   = output.joints[0, 21].cpu().numpy()
+    return vertices, faces, right_wrist
 
-# --- 시각화 관련 유틸리티 (기존과 동일) ---
+
 def create_open3d_mesh(vertices, faces):
-    mesh = o3d.geometry.TriangleMesh()
-    mesh.vertices = o3d.utility.Vector3dVector(vertices)
+    mesh           = o3d.geometry.TriangleMesh()
+    mesh.vertices  = o3d.utility.Vector3dVector(vertices)
     mesh.triangles = o3d.utility.Vector3iVector(faces)
     mesh.compute_vertex_normals()
     return mesh
 
+
 def create_studio_room():
-    geometries = []
     floor = o3d.geometry.TriangleMesh.create_box(width=10, height=0.01, depth=10)
     floor.translate([-5, -1.0, -5])
     floor.paint_uniform_color([0.3, 0.3, 0.3])
-    geometries.append(floor)
-    
+
     back_wall = o3d.geometry.TriangleMesh.create_box(width=10, height=5, depth=0.01)
     back_wall.translate([-5, -1.0, -5])
     back_wall.paint_uniform_color([0.2, 0.2, 0.2])
-    geometries.append(back_wall)
-    
-    return geometries
+
+    return [floor, back_wall]
+
+
+# ──────────────────────────────────────────────────────────
+# 전처리: raw → Kalman → Temporal
+# ──────────────────────────────────────────────────────────
+
+def preprocess_hands(T):
+    """모든 프레임의 손 데이터를 미리 로드하고 필터링합니다."""
+
+    # 1) Raw 로드
+    print("[INFO] 전체 프레임 손 데이터 로드 중...")
+    all_l_raw,  all_r_raw  = [], []
+    all_l_conf, all_r_conf = [], []
+
+    for i in range(T):
+        l, r, lc, rc = load_hamer_hands(i)
+        all_l_raw.append(l)
+        all_r_raw.append(r)
+        all_l_conf.append(lc)
+        all_r_conf.append(rc)
+
+    # 2) Kalman Filter
+    print("[INFO] Kalman Filter 처리 중...")
+    lh_kalman = HandPoseKalmanFilter(
+        fps=FPS, process_var=1e-4, obs_var=1e-2,
+        confidence_power=2.0, outlier_threshold=0.8,
+        outlier_noise_scale=10.0, device=device,
+    )
+    rh_kalman = HandPoseKalmanFilter(
+        fps=FPS, process_var=1e-4, obs_var=1e-2,
+        confidence_power=2.0, outlier_threshold=0.8,
+        outlier_noise_scale=10.0, device=device,
+    )
+
+    all_l_kalman, all_r_kalman = [], []
+    for i in range(T):
+        all_l_kalman.append(lh_kalman.update(all_l_raw[i], all_l_conf[i]))
+        all_r_kalman.append(rh_kalman.update(all_r_raw[i], all_r_conf[i]))
+
+    # 3) Temporal Smoother
+    print("[INFO] Temporal 모델 처리 중...")
+    lh_smoother = TemporalSmoother(TEMPORAL_MODEL_PATH, seq_len=31, device=device)
+    rh_smoother = TemporalSmoother(TEMPORAL_MODEL_PATH, seq_len=31, device=device)
+
+    all_l_temporal = lh_smoother.process_video(all_l_kalman)
+    all_r_temporal = rh_smoother.process_video(all_r_kalman)
+
+    return (
+        all_l_raw,      all_r_raw,
+        all_l_kalman,   all_r_kalman,
+        all_l_temporal, all_r_temporal,
+    )
+
+
+# ──────────────────────────────────────────────────────────
+# 애니메이션
+# ──────────────────────────────────────────────────────────
+
+# 모드 순환: raw → kalman → temporal → raw → ...
+MODES       = ["raw", "kalman", "temporal"]
+MODE_LABELS = {
+    "raw":      "Raw (필터 없음)",
+    "kalman":   "Kalman Filter",
+    "temporal": "Temporal Smoothing",
+}
+
 
 def animate_motion(model, motion, fps=30):
     T = motion["body_pose"].shape[0]
 
-    # 1. 초기 셋팅
-    l_hand, r_hand = load_hamer_hands(0)
-    vertices, faces, racket_pos = make_mesh_from_frame(
-        model, motion["body_pose"][0], motion["betas"][0], 
+    (all_l_raw, all_r_raw,
+     all_l_kalman, all_r_kalman,
+     all_l_temporal, all_r_temporal) = preprocess_hands(T)
+
+    # 프레임 수를 가장 짧은 시퀀스에 맞춤
+    T = min(T,
+            len(all_l_raw), len(all_r_raw),
+            len(all_l_kalman), len(all_r_kalman),
+            len(all_l_temporal), len(all_r_temporal))
+    print(f"[INFO] 재생 프레임 수: {T}")
+
+    # ── 데이터 맵 ──────────────────────────────────────────
+    hand_data = {
+        "raw":      (all_l_raw,      all_r_raw),
+        "kalman":   (all_l_kalman,   all_r_kalman),
+        "temporal": (all_l_temporal, all_r_temporal),
+    }
+
+    # ── 재생 상태 ──────────────────────────────────────────
+    state = {
+        "paused":  False,
+        "restart": False,
+        "frame":   0,
+        "mode":    "raw",       # raw | kalman | temporal
+    }
+
+    def _get_hands(i):
+        l_list, r_list = hand_data[state["mode"]]
+        return l_list[i], r_list[i]
+
+    # ── 키 콜백 ────────────────────────────────────────────
+    def toggle_pause(vis):
+        state["paused"] = not state["paused"]
+        print("[SPACE]", "일시정지" if state["paused"] else "재생")
+        return False
+
+    def cycle_mode(vis):
+        idx          = MODES.index(state["mode"])
+        state["mode"] = MODES[(idx + 1) % len(MODES)]
+        print(f"[M] 모드 전환 → {MODE_LABELS[state['mode']]}")
+        return False
+
+    def toggle_kalman(vis):
+        state["mode"] = "kalman" if state["mode"] != "kalman" else "raw"
+        print(f"[K] {MODE_LABELS[state['mode']]}")
+        return False
+
+    def toggle_temporal(vis):
+        state["mode"] = "temporal" if state["mode"] != "temporal" else "raw"
+        print(f"[T] {MODE_LABELS[state['mode']]}")
+        return False
+
+    def restart(vis):
+        state["restart"] = True
+        state["paused"]  = False
+        print("[R] 처음부터 재생")
+        return False
+
+    def step_forward(vis):
+        state["paused"] = True
+        state["frame"]  = min(state["frame"] + 1, T - 1)
+        print(f"[→] 프레임: {state['frame']}")
+        return False
+
+    def step_backward(vis):
+        state["paused"] = True
+        state["frame"]  = max(state["frame"] - 1, 0)
+        print(f"[←] 프레임: {state['frame']}")
+        return False
+
+    # ── 초기 메쉬 ──────────────────────────────────────────
+    l0, r0, _, _ = load_hamer_hands(0)
+    verts, faces, _ = make_mesh_from_frame(
+        model,
+        motion["body_pose"][0], motion["betas"][0],
         motion["global_orient"][0], motion["transl"][0],
-        l_hand, r_hand
+        l0, r0,
+    )
+    mesh = create_open3d_mesh(verts, faces)
+
+    # ── Visualizer ─────────────────────────────────────────
+    vis = o3d.visualization.VisualizerWithKeyCallback()
+    vis.create_window(
+        window_name=(
+            "HaMeR + GVHMR  |  SPACE: 정지/재생  |  R: 처음부터  "
+            "|  ←→: 프레임  |  K: Kalman  |  T: Temporal  |  M: 모드 순환"
+        ),
+        width=1280, height=720,
     )
 
+    vis.register_key_callback(ord(" "), toggle_pause)
+    vis.register_key_callback(ord("R"), restart)
+    vis.register_key_callback(ord("K"), toggle_kalman)
+    vis.register_key_callback(ord("T"), toggle_temporal)
+    vis.register_key_callback(ord("M"), cycle_mode)
+    vis.register_key_callback(262, step_forward)
+    vis.register_key_callback(263, step_backward)
 
-    mesh = create_open3d_mesh(vertices, faces)
-    racket = create_racket_mesh() # 라켓 생성
-    vis = o3d.visualization.Visualizer()
-    vis.create_window(window_name="HaMeR + GVHMR 통합 애니메이션", width=1280, height=720)
-    
-    # 배경 및 캐릭터 추가
-    for element in create_studio_room(): vis.add_geometry(element)
+    for elem in create_studio_room():
+        vis.add_geometry(elem)
     vis.add_geometry(mesh)
-    # vis.add_geometry(racket) # 라켓 추가
-    
-    
-    render_opt = vis.get_render_option()
-    render_opt.background_color = np.asarray([0.1, 0.1, 0.1])
-    
-    print("[INFO] Start animation: {} frames".format(T)) 
+
+    vis.get_render_option().background_color = np.array([0.1, 0.1, 0.1])
+
     frame_time = 1.0 / fps
+    i          = 0
+
+    print(f"\n[INFO] 재생 시작 ({T} 프레임)")
+    print("  SPACE: 정지/재생  |  R: 처음부터  |  ←→: 프레임 이동")
+    print("  K: Kalman  |  T: Temporal  |  M: 모드 순환 (raw → kalman → temporal)\n")
 
     try:
         while True:
-            for i in range(T):
-                start = time.time()
-                l_hand, r_hand = load_hamer_hands(i)
+            if state["restart"]:
+                state["restart"] = False
+                state["frame"]   = 0
+                i                = 0
 
-                # 2. 메쉬와 라켓 위치 업데이트
-                vertices, _, racket_pos = make_mesh_from_frame(
-                    model, motion["body_pose"][i], motion["betas"][i],
-                    motion["global_orient"][i], motion["transl"][i],
-                    l_hand, r_hand
-                )
+            if state["paused"]:
+                i = state["frame"]
+            else:
+                state["frame"] = i
 
-                # 캐릭터 업데이트
-                mesh.vertices = o3d.utility.Vector3dVector(vertices)
-                mesh.compute_vertex_normals()
-                
-                # 라켓 업데이트 (손목 위치로 이동)
-                # 손가락 각도에 맞춘 회전까지 넣으려면 Transformation Matrix를 써야 하지만,
-                # 일단 위치만 맞춰도 '쥐고 있는' 느낌이 납니다!
-                # racket.transform(np.eye(4)) # 초기화 느낌으로 갱신 (Open3D 특성상)
-                # racket.translate(racket_pos, relative=False) 
+            l_hand, r_hand = _get_hands(i)
 
-                vis.update_geometry(mesh)
-                vis.update_geometry(racket)
-                vis.poll_events()
-                vis.update_renderer()
-                
-                elapsed = time.time() - start
-                time.sleep(max(0.0, frame_time - elapsed))
+            start = time.time()
+            verts, _, _ = make_mesh_from_frame(
+                model,
+                motion["body_pose"][i], motion["betas"][i],
+                motion["global_orient"][i], motion["transl"][i],
+                l_hand, r_hand,
+            )
+            mesh.vertices = o3d.utility.Vector3dVector(verts)
+            mesh.compute_vertex_normals()
+            vis.update_geometry(mesh)
+            vis.poll_events()
+            vis.update_renderer()
+
+            if state["paused"]:
+                time.sleep(0.03)
+                continue
+
+            elapsed = time.time() - start
+            time.sleep(max(0.0, frame_time - elapsed))
+            i = (i + 1) % T
 
     except KeyboardInterrupt:
-        print("[INFO] Stopped.")
+        print("[INFO] 종료.")
     finally:
         vis.destroy_window()
 
+
+# ──────────────────────────────────────────────────────────
+# 진입점
+# ──────────────────────────────────────────────────────────
+
 def main():
     motion = load_motion(PT_PATH, PARAM_KEY)
-    model = build_smpl_model(MODEL_PATH, GENDER)
+    model  = build_smpl_model(MODEL_PATH, GENDER)
     animate_motion(model, motion, FPS)
+
 
 if __name__ == "__main__":
     main()
