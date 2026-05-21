@@ -35,7 +35,7 @@ def make_smplx(type="neu_fullpose", **kwargs):
             "model_type": "smplx",
             "gender": "neutral",
             "use_pca": False,
-            "flat_hand_mean": False,
+            "flat_hand_mean": True,
             "create_left_hand_pose": True,
             "create_right_hand_pose": True,
             "create_expression": True,

@@ -1,280 +1,224 @@
-import numpy as np
 import torch
-import matplotlib.pyplot as plt
-import matplotlib.animation as animation
+import numpy as np
+import pyvista as pv
+import smplx
 from scipy.spatial.transform import Rotation as R
-from scipy.spatial.transform import Slerp
-import os
 
-class Particle:
-    def __init__(self, pos, mass):
-        self.pos = np.array(pos, dtype=float)
-        self.prev_pos = np.copy(self.pos)
-        self.vel = np.zeros(3)
-        self.inv_mass = 0.0 if mass == 0.0 else 1.0 / mass
+# ═══════════════════════════════════════════════════════════════
+# 1. One-Euro 필터
+# ═══════════════════════════════════════════════════════════════
 
-class DistanceConstraint:
-    def __init__(self, p1_idx, p2_idx, length, compliance=0.0):
-        self.p1_idx, self.p2_idx = p1_idx, p2_idx
-        self.length = length
-        self.compliance = compliance
-
-    def solve(self, particles, dt):
-        p1, p2 = particles[self.p1_idx], particles[self.p2_idx]
-        w_sum = p1.inv_mass + p2.inv_mass
-        if w_sum == 0.0: return
-        dir_vec = p1.pos - p2.pos
-        cur_len = np.linalg.norm(dir_vec)
-        if cur_len == 0.0: return
-        C = cur_len - self.length
-        alpha = self.compliance / (dt * dt)
-        delta_lambda = -C / (w_sum + alpha)
-        move = delta_lambda * (dir_vec / cur_len)
-        p1.pos += p1.inv_mass * move
-        p2.pos -= p2.inv_mass * move
-
-class TrackingConstraint:
-    def __init__(self, p_idx, compliance):
-        self.p_idx = p_idx
-        self.target_pos = np.zeros(3)
-        self.compliance = compliance
-
-    def solve(self, particles, dt):
-        p = particles[self.p_idx]
-        if p.inv_mass == 0.0: return
-        diff = p.pos - self.target_pos
-        C_len = np.linalg.norm(diff)
-        if C_len == 0.0: return
-        alpha = self.compliance / (dt * dt)
-        delta_lambda = -C_len / (p.inv_mass + alpha)
-        p.pos += p.inv_mass * delta_lambda * (diff / C_len)
-
-class OneEuroFilterVectorized:
+class OneEuroFilter:
     def __init__(self, t0, x0, min_cutoff=1.0, beta=0.05, d_cutoff=1.0):
         self.min_cutoff = min_cutoff
-        self.beta = beta
-        self.d_cutoff = d_cutoff
-        self.x_prev = x0.copy()
-        self.dx_prev = np.zeros_like(x0)
-        self.t_prev = t0
+        self.beta       = beta
+        self.d_cutoff   = d_cutoff
+        self.x_prev     = x0.copy()
+        self.dx_prev    = np.zeros_like(x0)
+        self.t_prev     = t0
 
-    def smoothing_factor(self, t_e, cutoff):
+    def _sf(self, t_e, cutoff):
         r = 2 * np.pi * cutoff * t_e
         return r / (r + 1)
 
     def __call__(self, t, x):
         t_e = t - self.t_prev
-        if t_e <= 0.0: return x
-        dx = (x - self.x_prev) / t_e
-        alpha_d = self.smoothing_factor(t_e, self.d_cutoff)
-        dx_hat = alpha_d * dx + (1 - alpha_d) * self.dx_prev
-        cutoff = self.min_cutoff + self.beta * np.linalg.norm(dx_hat, axis=-1, keepdims=True)
-        alpha = self.smoothing_factor(t_e, cutoff)
-        x_hat = alpha * x + (1 - alpha) * self.x_prev
-        self.x_prev, self.dx_prev, self.t_prev = x_hat.copy(), dx_hat.copy(), t
+        if t_e <= 0:
+            return x
+        dx      = (x - self.x_prev) / t_e
+        ad      = self._sf(t_e, self.d_cutoff)
+        dx_hat  = ad * dx + (1 - ad) * self.dx_prev
+        cutoff  = self.min_cutoff + self.beta * np.abs(dx_hat)
+        a       = self._sf(t_e, cutoff)
+        x_hat   = a * x + (1 - a) * self.x_prev
+        self.x_prev  = x_hat.copy()
+        self.dx_prev = dx_hat.copy()
+        self.t_prev  = t
         return x_hat
 
-def get_rotation_between_vectors(v1, v2):
-    v1_u = v1 / (np.linalg.norm(v1) + 1e-8)
-    v2_u = v2 / (np.linalg.norm(v2) + 1e-8)
-    cross = np.cross(v1_u, v2_u)
-    dot = np.dot(v1_u, v2_u)
-    s = np.linalg.norm(cross)
-    if s < 1e-8:
-        return R.identity()
-    axis = cross / s
-    angle = np.arccos(np.clip(dot, -1.0, 1.0))
-    return R.from_rotvec(axis * angle)
+# ═══════════════════════════════════════════════════════════════
+# 2. 필터링 유틸
+# ═══════════════════════════════════════════════════════════════
 
-def process_full_tennis_pipeline(arm_positions, global_orient_3, local_pose_45, fps=30, is_swing_segment=True):
-    T = local_pose_45.shape[0]
+def filter_rotations(rot_seq, fps=30):
+    """rot_seq: (T, N, 3) rotvecs → smoothed (T, N, 3) rotvecs"""
+    T, N, _ = rot_seq.shape
     dt = 1.0 / fps
-    substeps = 10
-    sub_dt = dt / substeps
-    timestamps = np.arange(T) * dt
 
-    particles = [
-        Particle(arm_positions[0, 0], mass=0.0),
-        Particle(arm_positions[0, 1], mass=2.5),
-        Particle(arm_positions[0, 2], mass=1.8),
-        Particle(arm_positions[0, 2] + np.array([0, -0.6, 0]), mass=1.2)
-    ]
-    
-    l_upper = np.linalg.norm(arm_positions[0, 0] - arm_positions[0, 1])
-    l_lower = np.linalg.norm(arm_positions[0, 1] - arm_positions[0, 2])
-    l_racket = 0.6
-    
-    constraints = [
-        DistanceConstraint(0, 1, l_upper, 0.0),
-        DistanceConstraint(1, 2, l_lower, 0.0),
-        DistanceConstraint(2, 3, l_racket, 0.0) 
-    ]
-    
-    track_elbow = TrackingConstraint(1, compliance=0.002)
-    track_wrist = TrackingConstraint(2, compliance=0.005)
+    # 로컬 회전을 Euler로 변환 후 unwrap
+    euler   = R.from_rotvec(rot_seq.reshape(-1, 3)).as_euler('XYZ').reshape(T, N, 3)
+    euler_u = np.unwrap(euler, axis=0)
 
-    local_15x3 = local_pose_45.reshape(T, 15, 3)
-    init_euler = R.from_rotvec(local_15x3[0]).as_euler('XYZ', degrees=False)
-    one_euro = OneEuroFilterVectorized(0.0, init_euler, min_cutoff=0.5, beta=0.05)
-    
-    all_euler = R.from_rotvec(local_15x3.reshape(-1, 3)).as_euler('XYZ', degrees=False).reshape(T, 15, 3)
-    all_euler_unwrapped = np.unwrap(all_euler, axis=0)
-
-    final_global_orient_3 = np.zeros_like(global_orient_3)
-    final_local_pose_45 = np.zeros_like(local_pose_45)
-
-    target_grip_quat = R.from_rotvec(np.ones((15, 3)) * 0.2).as_quat() 
-
-    print("🚀 통합 파이프라인 시작...")
+    oef = OneEuroFilter(0.0, euler_u[0].flatten(), min_cutoff=0.8, beta=0.03)
+    out = np.zeros_like(rot_seq)
 
     for i in range(T):
-        particles[0].pos = particles[0].prev_pos = arm_positions[i, 0]
-        track_elbow.target_pos = arm_positions[i, 1]
-        track_wrist.target_pos = arm_positions[i, 2]
-        target_racket_pos = track_wrist.target_pos + np.array([0, -0.6, 0])
+        smoothed = oef(i * dt, euler_u[i].flatten()).reshape(N, 3)
+        out[i]   = R.from_euler('XYZ', smoothed).as_rotvec().reshape(N, 3)
 
-        for _ in range(substeps):
-            for p in particles:
-                if p.inv_mass > 0:
-                    p.vel += np.array([0, -9.81, 0]) * sub_dt
-                    p.prev_pos = np.copy(p.pos)
-                    p.pos += p.vel * sub_dt
-            for _ in range(3):
-                for c in constraints: c.solve(particles, sub_dt)
-                track_elbow.solve(particles, sub_dt)
-                track_wrist.solve(particles, sub_dt)
-            for p in particles:
-                if p.inv_mass > 0: p.vel = (p.pos - p.prev_pos) / sub_dt
+    return out
 
-        physics_wrist_pos = particles[2].pos
-        physics_racket_pos = particles[3].pos
 
-        orig_dir = target_racket_pos - track_wrist.target_pos
-        physics_dir = physics_racket_pos - physics_wrist_pos
-        
-        delta_rot = get_rotation_between_vectors(orig_dir, physics_dir)
-        orig_wrist_rot = R.from_rotvec(global_orient_3[i])
-        new_wrist_rot = delta_rot * orig_wrist_rot
-        final_global_orient_3[i] = new_wrist_rot.as_rotvec()
+def filter_translations(trans_seq, fps=30):
+    """trans_seq: (T, 3) → smoothed (T, 3)"""
+    T = trans_seq.shape[0]
+    dt  = 1.0 / fps
+    oef = OneEuroFilter(0.0, trans_seq[0].copy(), min_cutoff=0.8, beta=0.03)
+    out = np.zeros_like(trans_seq)
+    for i in range(T):
+        out[i] = oef(i * dt, trans_seq[i])
+    return out
 
-        smoothed_euler = one_euro(timestamps[i], all_euler_unwrapped[i])
-        smoothed_quats = R.from_euler('XYZ', smoothed_euler.reshape(-1, 3), degrees=False).as_quat()
+# ═══════════════════════════════════════════════════════════════
+# 3. SMPL-X Forward (배치 청크)
+# ═══════════════════════════════════════════════════════════════
 
-        refined_quats = np.zeros_like(smoothed_quats)
-        for j in range(15):
-            if is_swing_segment:
-                key_quats = R.from_quat([smoothed_quats[j], target_grip_quat[j]])
-                refined_quats[j] = Slerp([0, 1], key_quats)([0.8])[0].as_quat()
-            else:
-                refined_quats[j] = smoothed_quats[j]
+def smplx_forward_chunked(model, params_np, T, chunk=64):
+    """
+    메모리 절약을 위해 chunk 단위로 forward.
+    params_np: dict of numpy arrays, each (T, D)
+    반환: (T, V, 3) numpy vertices
+    """
+    verts_list = []
+    for start in range(0, T, chunk):
+        end = min(start + chunk, T)
+        feed = {}
+        for k, v in params_np.items():
+            t = torch.tensor(v[start:end]).float()
+            feed[k] = t
+        # expression이 없으면 betas 배치 크기에 맞게 0으로 채움
+        if 'expression' not in feed:
+            bs = end - start
+            feed['expression'] = torch.zeros(bs, 10, dtype=torch.float32)
+        with torch.no_grad():
+            out = model(**feed)
+        verts_list.append(out.vertices.numpy())
+    return np.concatenate(verts_list, axis=0)
 
-        final_local_pose_45[i] = R.from_quat(refined_quats).as_rotvec().reshape(45)
-
-    final_48d_pose = np.concatenate([final_global_orient_3, final_local_pose_45], axis=1)
-    print("✅ 처리 완료!")
-    return final_48d_pose
+# ═══════════════════════════════════════════════════════════════
+# 4. 메인 애니메이션
+# ═══════════════════════════════════════════════════════════════
 
 def run_animation():
-    T_frames = 150
+    data_path  = r"c:\Users\user\Desktop\CG\캡스톤\4k_tennis\smplx_merged_hamer.pt"
+    model_path = r"model\SMPLX_NEUTRAL.npz"
+
+    # ── 데이터 로드 ──────────────────────────────────────────
+    print(f"데이터 로딩: {data_path}")
+    data   = torch.load(data_path, map_location='cpu')
+    params = data['smpl_params_global']
+
+    T   = params['body_pose'].shape[0]
     fps = 30
-    
-    npz_path = "interhand_val.npz"
-    local_pose_45 = np.zeros((T_frames, 45))
-    
-    if os.path.exists(npz_path):
-        print(f"📦 실제 데이터셋 로드: {npz_path}")
-        data = np.load(npz_path)
-        hand_pose_all = data['hand_pose']
-        length = min(T_frames, len(hand_pose_all))
-        T_frames = length
-        local_pose_45[:length] = hand_pose_all[:length]
-        
-        local_pose_45 += np.random.randn(*local_pose_45.shape) * 0.1
-    else:
-        print(f"⚠️ {npz_path} 없음. 가짜 흔들림(Jitter) 데이터를 임의 생성합니다.")
-        t = np.linspace(0, 4 * np.pi, T_frames)
-        for i in range(45):
-            local_pose_45[:, i] = np.sin(t * (1 + i * 0.1)) * 0.3 + np.random.randn(T_frames) * 0.1
+    print(f"  총 {T} 프레임, {fps} fps")
 
-    dummy_arm_pos = np.zeros((T_frames, 3, 3)) 
-    dummy_arm_pos[:, 1] = [0, -0.3, 0]
-    dummy_arm_pos[:, 2] = [0, -0.6, 0]
-    
-    swing_t = np.linspace(0, 2 * np.pi, T_frames)
-    dummy_arm_pos[:, 2, 0] = np.sin(swing_t) * 0.6
-    dummy_arm_pos[:, 2, 1] = -0.6 + np.sin(swing_t * 2) * 0.2
-    dummy_arm_pos[:, 2, 2] = np.cos(swing_t) * 0.5
-    
-    dummy_global = np.zeros((T_frames, 3))
-    dummy_global[:, 0] = np.sin(swing_t) * 0.5
-    
-    final_48d_pose = process_full_tennis_pipeline(
-        arm_positions=dummy_arm_pos,
-        global_orient_3=dummy_global,
-        local_pose_45=local_pose_45,
-        fps=fps,
-        is_swing_segment=True
+    # ── SMPL-X 파라미터를 numpy로 변환 ───────────────────────
+    rot_keys = [
+        'global_orient', 'body_pose',
+        'left_hand_pose', 'right_hand_pose',
+        'jaw_pose', 'leye_pose', 'reye_pose',
+    ]
+
+    raw_params      = {}
+    smoothed_params = {}
+
+    print("One-Euro 필터 적용 중...")
+    for k, v in params.items():
+        val = v.numpy() if isinstance(v, torch.Tensor) else np.array(v)
+        raw_params[k] = val
+
+        if k in rot_keys:
+            N     = val.shape[1] // 3
+            val_r = val.reshape(T, N, 3)
+            smoothed_params[k] = filter_rotations(val_r, fps).reshape(T, -1)
+        elif k == 'transl':
+            smoothed_params[k] = filter_translations(val, fps)
+        else:
+            # betas 등 – 그대로 복사
+            smoothed_params[k] = val.copy()
+
+    # ── SMPL-X 모델 로드 ─────────────────────────────────────
+    print(f"SMPL-X 모델 로딩: {model_path}")
+    smplx_model = smplx.create(
+        model_path,
+        model_type='smplx',
+        use_pca=False,   # hand_pose가 45차원 full rotation
+        batch_size=1,
     )
-    
-    try:
-        from smplx import MANO
-        print("💡 smplx 모듈이 감지되었습니다. 3D 관절 렌더링을 준비합니다...")
-        device = torch.device("cpu")
-        mano_layer = MANO(model_path="mano", is_rhand=True, use_pca=False).to(device)
-        
-        orig_global = torch.tensor(dummy_global, dtype=torch.float32)
-        orig_local = torch.tensor(local_pose_45, dtype=torch.float32)
-        with torch.no_grad():
-            orig_output = mano_layer(global_orient=orig_global, hand_pose=orig_local)
-            orig_joints = orig_output.joints.numpy()
-            
-        proc_global = torch.tensor(final_48d_pose[:, :3], dtype=torch.float32)
-        proc_local = torch.tensor(final_48d_pose[:, 3:], dtype=torch.float32)
-        with torch.no_grad():
-            proc_output = mano_layer(global_orient=proc_global, hand_pose=proc_local)
-            proc_joints = proc_output.joints.numpy()
-            
-        fig = plt.figure(figsize=(12, 6))
-        ax1 = fig.add_subplot(121, projection='3d')
-        ax2 = fig.add_subplot(122, projection='3d')
-        
-        ax1.set_title("Before")
-        ax2.set_title("After")
-        
-        scat_orig = ax1.scatter([], [], [], c='r', s=20)
-        scat_proc = ax2.scatter([], [], [], c='b', s=20)
+    faces = smplx_model.faces   # (F, 3)
 
-        def set_axes(ax):
-            ax.set_xlim([-0.8, 0.8])
-            ax.set_ylim([-0.8, 0.8])
-            ax.set_zlim([-0.8, 0.8])
-            ax.set_xlabel('X')
-            ax.set_ylabel('Y')
-            ax.set_zlabel('Z')
-            
-        set_axes(ax1)
-        set_axes(ax2)
-        
-        def update(frame):
-            scat_orig._offsets3d = (
-                orig_joints[frame, :, 0], 
-                orig_joints[frame, :, 1], 
-                orig_joints[frame, :, 2]
-            )
-            scat_proc._offsets3d = (
-                proc_joints[frame, :, 0], 
-                proc_joints[frame, :, 1], 
-                proc_joints[frame, :, 2]
-            )
-            return scat_orig, scat_proc
+    # ── Forward Kinematics (청크 단위) ────────────────────────
+    print("Raw 포즈 FK 계산 중...")
+    verts_raw = smplx_forward_chunked(smplx_model, raw_params, T, chunk=64)
+    print(f"  verts_raw  shape = {verts_raw.shape}")
 
-        ani = animation.FuncAnimation(fig, update, frames=T_frames, interval=1000/fps, blit=False)
-        plt.tight_layout()
-        plt.show()
+    print("Smooth 포즈 FK 계산 중...")
+    verts_smooth = smplx_forward_chunked(smplx_model, smoothed_params, T, chunk=64)
+    print(f"  verts_smooth shape = {verts_smooth.shape}")
 
-    except ImportError:
-        print("smplx 모듈이 없어 3D 렌더링을 할 수 없습니다.")
-        print("그래프 시각화 없이 내부 처리만 정상 완료되었습니다.")
+    # ── PyVista 애니메이션 ────────────────────────────────────
+    print("PyVista 플로터 초기화...")
+
+    # faces → PyVista 형식 [3, i0, i1, i2, 3, i0, ...]
+    pv_faces = np.column_stack(
+        (np.full(len(faces), 3, dtype=np.int64), faces)
+    ).flatten()
+
+    mesh_raw    = pv.PolyData(verts_raw[0].copy(),    pv_faces)
+    mesh_smooth = pv.PolyData(verts_smooth[0].copy(),  pv_faces)
+
+    pl = pv.Plotter(shape=(1, 2), window_size=(1600, 800),
+                     title="SMPL-X Post-Processing Comparison")
+
+    # — Left: Before ——————————————————————————————————————
+    pl.subplot(0, 0)
+    pl.add_text("Before  (Raw)", color='#ff7b72', font_size=14)
+    pl.add_mesh(mesh_raw, color='#ffa0a0', smooth_shading=True,
+                specular=0.5, specular_power=30)
+
+    # — Right: After ——————————————————————————————————————
+    pl.subplot(0, 1)
+    pl.add_text("After  (One-Euro Smoothed)", color='#79c0ff', font_size=14)
+    pl.add_mesh(mesh_smooth, color='#a0d0ff', smooth_shading=True,
+                specular=0.5, specular_power=30)
+
+    # 카메라 동기화
+    pl.link_views()
+
+    # 초기 카메라 — 정면에서 보기
+    # SMPL-X 좌표: X=좌우, Y=상하, Z=앞뒤
+    center = verts_raw[0].mean(axis=0)
+    cam_offset = np.array([0, 0, 5.0])   # 조금 더 멀리서 비추기
+    pl.camera.focal_point = center
+    pl.camera.position    = center + cam_offset
+    pl.camera.up          = (0, 1, 0)    # Y-up (위아래 반전 수정)
+
+    print(f"재생 시작 ({T} 프레임, {fps} fps)")
+    print("  마우스 드래그로 시점 회전, 스크롤로 확대/축소")
+    print("  창을 닫으면 종료됩니다.")
+
+    # ── 수동 애니메이션 루프 ──────────────────────────────────
+    import time
+    pl.show(interactive_update=True)
+
+    frame = 0
+    while not pl.window_size == (0, 0):
+        try:
+            idx = frame % T
+            mesh_raw.points    = verts_raw[idx]
+            mesh_smooth.points = verts_smooth[idx]
+
+            # 카메라가 모델 중심을 따라가도록 갱신
+            center = verts_raw[idx].mean(axis=0)
+            pl.camera.focal_point = center
+            pl.camera.position    = center + cam_offset
+
+            pl.update()
+            frame += 1
+            time.sleep(1.0 / fps)
+        except Exception:
+            break
+
 
 if __name__ == "__main__":
     run_animation()
