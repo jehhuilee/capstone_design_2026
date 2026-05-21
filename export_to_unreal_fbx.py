@@ -1,83 +1,157 @@
 import bpy
 import sys
 import os
+import numpy as np
 
-# ==============================================================================
-# SMPL-X to FBX Exporter for Unreal Engine
-# 이 스크립트는 백그라운드 모드(headless)로 실행되어야 합니다.
-# 
-# 실행 방법:
-# blender --background --python export_to_unreal_fbx.py -- [npz_파일_경로] [저장할_fbx_경로]
-#
-# 주의: Blender 내부에 SMPL-X for Blender Add-on이 설치되어 있어야 합니다.
-# ==============================================================================
+def convert_hmr_to_amass(input_npz, output_npz):
+    data = np.load(input_npz, allow_pickle=True)
+    
+    N = data['global_orient'].shape[0]
+    
+    poses = np.zeros((N, 165), dtype=np.float32)
+    poses[:, 0:3] = data['global_orient']
+    if 'body_pose' in data:
+        poses[:, 3:66] = data['body_pose']
+    
+    if 'left_hand_pose' in data:
+        poses[:, 75:120] = data['left_hand_pose']
+    if 'right_hand_pose' in data:
+        poses[:, 120:165] = data['right_hand_pose']
+        
+    trans = data['transl'] if 'transl' in data else np.zeros((N, 3), dtype=np.float32)
+    
+    betas = data['betas'] if 'betas' in data else np.zeros(10, dtype=np.float32)
+    if len(betas.shape) == 2:
+        betas = betas[0]
+        
+    gender = str(data['gender']) if 'gender' in data else 'neutral'
+    
+    np.savez(output_npz,
+             poses=poses,
+             trans=trans,
+             betas=betas,
+             gender=gender,
+             mocap_frame_rate=30.0)
 
 def main():
     argv = sys.argv
     if "--" not in argv:
-        print("Error: 인자가 부족합니다. '--' 뒤에 npz 경로와 fbx 출력 경로를 입력하세요.")
+        print("Error: Not enough arguments.")
         sys.exit(1)
         
     args = argv[argv.index("--") + 1:]
-    if len(args) < 2:
-        print("Usage: blender --background --python export_to_unreal_fbx.py -- <input.npz> <output.fbx>")
+    if len(args) < 1:
+        print("Usage: blender -b smplx_template.blend -P export_to_unreal_fbx.py -- <input.npz> [output_dir]")
         sys.exit(1)
         
     animation_file = os.path.abspath(args[0])
-    output_fbx = os.path.abspath(args[1])
     
-    # SMPL-X 모델 디렉토리 경로 (본인 환경에 맞게 수정 필요)
-    smplx_model_dir = os.path.abspath("model") 
-    
+    if len(args) >= 2:
+        output_dir = os.path.abspath(args[1])
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+    else:
+        output_dir = os.path.dirname(animation_file)
+        
+    base_name = os.path.splitext(os.path.basename(animation_file))[0]
+    output_fbx = os.path.join(output_dir, f"{base_name}_unreal.fbx")
+
+    print("--------------------------------------------------")
     print(f"Input NPZ : {animation_file}")
     print(f"Output FBX: {output_fbx}")
     print("--------------------------------------------------")
 
-    # 1. 씬 초기화
-    bpy.ops.object.select_all(action='SELECT')
-    bpy.ops.object.delete()
+    # Create temporary AMASS npz
+    temp_npz = os.path.join(output_dir, f"{base_name}_amass_temp.npz")
+    print("Converting HMR NPZ to AMASS NPZ format...")
+    convert_hmr_to_amass(animation_file, temp_npz)
 
-    # 2. SMPL-X 메쉬 추가 및 애니메이션 로드
-    try:
-        # 중립(NEUTRAL) 젠더 모델 추가
-        # Add-on 버전에 따라 파라미터가 다를 수 있습니다.
-        bpy.ops.smplx.add_gender(gender='NEUTRAL', model_dir=smplx_model_dir)
-        
-        # 추가된 객체가 활성화되어 있는지 확인
-        if bpy.context.active_object is None or "SMPLX" not in bpy.context.active_object.name:
-            print("Error: SMPL-X 객체가 정상적으로 생성되지 않았습니다.")
-            sys.exit(1)
+    # Find Armature
+    armature_obj = None
+    for obj in bpy.context.scene.objects:
+        if obj.type == 'ARMATURE':
+            armature_obj = obj
+            break
             
-        # 애니메이션 파일(.npz) 적용
-        bpy.ops.smplx.load_animation(filepath=animation_file)
-        print("애니메이션 로드 완료.")
+    if armature_obj is None:
+        print("Error: No armature found.")
+        sys.exit(1)
         
-    except AttributeError:
-        print("Error: SMPL-X Blender Add-on이 설치되어 있지 않거나 활성화되지 않았습니다.")
-        print("블렌더 설정(Preferences) -> Add-ons에서 SMPL-X 애드온을 확인해주세요.")
-        sys.exit(1)
-    except Exception as e:
-        print(f"Error during SMPL-X generation: {e}")
-        sys.exit(1)
+    bpy.ops.object.select_all(action='DESELECT')
+    armature_obj.select_set(True)
+    bpy.context.view_layer.objects.active = armature_obj
 
-    # 3. 언리얼 엔진 호환성을 위한 FBX 추출
-    # 언리얼 기준 Forward: X (또는 -Y), Up: Z 이지만 기본 축으로 맞추고 엔진에서 자동 변환하는 것이 일반적입니다.
-    print(f"FBX 추출 시작: {output_fbx}")
+    # Load SMPL-X Animation using converted npz
+    try:
+        if hasattr(bpy.ops.object, 'smplx_add_animation'):
+            # anim_format='AMASS' applies a -90 degree rotation on the root bone to correctly orient it from OpenGL Y-up to Z-up, matching Unreal!
+            bpy.ops.object.smplx_add_animation(filepath=temp_npz, anim_format='AMASS')
+            print("Animation loaded successfully.")
+        else:
+            print("Error: smplx_add_animation operator not found.")
+            sys.exit(1)
+    except Exception as e:
+        print(f"Error during animation load: {e}")
+        sys.exit(1)
+    finally:
+        if os.path.exists(temp_npz):
+            os.remove(temp_npz)
+
+    # After animation load, find the newly created armature
+    # The addon creates a new armature and mesh. The active object might be the mesh.
+    # We will look for the armature that was just created (its name will contain "temp" because of temp_npz)
+    final_armature = None
+    for obj in bpy.data.objects:
+        if obj.type == 'ARMATURE' and 'amass_temp' in obj.name:
+            final_armature = obj
+            break
+            
+    # Fallback: just find any armature that is not the original one
+    if not final_armature:
+        for obj in bpy.data.objects:
+            if obj.type == 'ARMATURE' and obj != armature_obj:
+                final_armature = obj
+                break
+                
+    if not final_armature:
+        final_armature = armature_obj  # fallback to whatever we had
+        
+    if final_armature and final_armature.type == 'ARMATURE':
+        # Rename armature to "root" so Unreal Engine creates a proper root bone
+        final_armature.name = "root"
+        
+        # Ensure only this armature and its child meshes are selected for export
+        bpy.ops.object.select_all(action='DESELECT')
+        final_armature.select_set(True)
+        # Also select the mesh that the addon created. Usually it's parented to the armature, or it has an armature modifier.
+        # Let's just find meshes that have an armature modifier pointing to this armature.
+        for obj in bpy.data.objects:
+            if obj.type == 'MESH':
+                for mod in obj.modifiers:
+                    if mod.type == 'ARMATURE' and mod.object == final_armature:
+                        obj.select_set(True)
+                        # Remove shape keys if they cause issues in Unreal (Optional, but let's keep them and rely on bake_anim)
+        
+        bpy.context.view_layer.objects.active = final_armature
+    
+    # Export FBX
+    print(f"Starting FBX Export: {output_fbx}")
     bpy.ops.export_scene.fbx(
         filepath=output_fbx,
-        use_selection=False,         # 씬 전체 익스포트
+        use_selection=True,
         global_scale=1.0,
-        bake_anim=True,              # 애니메이션 베이킹 필수
-        add_leaf_bones=False,        # 언리얼 스켈레탈 메쉬 뼈대 생성 방지를 위해 False
+        bake_anim=True,
+        add_leaf_bones=False,
         primary_bone_axis='Y',
         secondary_bone_axis='X',
-        axis_forward='-Z',
-        axis_up='Y',
+        axis_forward='X',
+        axis_up='Z',
+        bake_space_transform=True,
         path_mode='COPY',
         embed_textures=False
     )
     
-    print("FBX 추출 성공!")
+    print("FBX Export success!")
 
 if __name__ == "__main__":
     main()

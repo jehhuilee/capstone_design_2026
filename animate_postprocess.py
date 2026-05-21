@@ -346,7 +346,33 @@ def run_animation():
     print(f"처리된 애니메이션 데이터를 저장합니다: {out_npz}")
     np.savez(out_npz, **smoothed_params)
     print("   저장된 데이터를 서버에서 변환 스크립트(BVH 등)로 처리할 수 있습니다.")
-
+    
+    # ── 언리얼 엔진용 FBX 자동 추출 ──────────────────────────────────────
+    import subprocess
+    import os
+    print("\n   Unreal Engine 호환 FBX 파일로 변환을 시작합니다...")
+    blender_path = r"C:\Program Files\Blender Foundation\Blender 5.1\blender.exe"
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    blend_file = os.path.join(base_dir, "smplx_template.blend")
+    export_script = os.path.join(base_dir, "export_to_unreal_fbx.py")
+    
+    # 현재 파일 기준 Result 폴더 지정
+    result_dir = os.path.join(base_dir, "Result")
+    
+    cmd = [
+        blender_path,
+        "-b", blend_file,
+        "-P", export_script,
+        "--",
+        out_npz,
+        result_dir
+    ]
+    
+    try:
+        subprocess.run(cmd, check=True)
+        print(f"   FBX 변환 성공! 결과물은 다음 폴더에 있습니다: {result_dir}")
+    except Exception as e:
+        print(f"   FBX 변환 중 오류가 발생했습니다: {e}")
 
 if __name__ == "__main__":
     run_animation()
