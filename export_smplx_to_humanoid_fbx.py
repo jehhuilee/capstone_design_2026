@@ -626,16 +626,70 @@ def rename_objects(arm: bpy.types.Object, meshes: List[bpy.types.Object]) -> Non
         mesh.data.name = mesh.name + "Mesh"
 
 
-def export_fbx(path: str, engine: str) -> None:
+def bake_to_keyframes(
+    arm: bpy.types.Object,
+    frame_start: int,
+    frame_end: int,
+) -> None:
+    """Blender 5.x 슬롯 기반 Action을 전통적 키프레임으로 변환.
+
+    smplx_add_animation이 생성한 슬롯 기반 fcurves는
+    FBX exporter가 제대로 처리하지 못할 수 있으므로,
+    NLA bake로 전통적 pose bone 키프레임을 강제로 작성한다.
+    """
+    if bpy.context.mode != "OBJECT":
+        bpy.ops.object.mode_set(mode="OBJECT")
+    bpy.ops.object.select_all(action="DESELECT")
+    arm.select_set(True)
+    bpy.context.view_layer.objects.active = arm
+    bpy.ops.object.mode_set(mode="POSE")
+    bpy.ops.pose.select_all(action="SELECT")
+
+    bake_kwargs = dict(
+        frame_start=frame_start,
+        frame_end=frame_end,
+        step=1,
+        only_selected=False,
+        visual_keying=True,
+        clear_constraints=False,
+        clear_parents=False,
+        use_current_action=True,
+        bake_types={"POSE"},
+    )
+
+    try:
+        bpy.ops.nla.bake(**bake_kwargs, channel_types={"LOCATION", "ROTATION", "SCALE"})
+    except TypeError:
+        bpy.ops.nla.bake(**bake_kwargs)
+
+    bpy.ops.object.mode_set(mode="OBJECT")
+
+    # 결과 확인
+    if arm.animation_data and arm.animation_data.action:
+        act = arm.animation_data.action
+        fc_count = 0
+        try:
+            fc_count = len(list(act.fcurves))
+        except (AttributeError, TypeError):
+            pass
+        print(f"[Bake] action={act.name}, fcurves={fc_count}, "
+              f"range={frame_start}-{frame_end}")
+    else:
+        print("[Bake] WARNING: no action after bake")
+
+
+def export_fbx(path: str, engine: str, anim_only: bool = False) -> None:
     preset = EXPORT_AXIS[engine]
-    print(f"\n[FBX Export] {path}  engine={engine}")
+    obj_types = {"ARMATURE"} if anim_only else {"ARMATURE", "MESH"}
+    tag = "Animation-Only" if anim_only else "Full"
+    print(f"\n[FBX Export ({tag})] {path}  engine={engine}")
     bpy.ops.export_scene.fbx(
         filepath=path,
         use_selection=True,
         global_scale=1.0,
         apply_unit_scale=True,
         apply_scale_options="FBX_SCALE_NONE",
-        object_types={"ARMATURE", "MESH"},
+        object_types=obj_types,
         use_mesh_modifiers=True,
         mesh_smooth_type="FACE",
         use_subsurf=False,
@@ -644,7 +698,7 @@ def export_fbx(path: str, engine: str) -> None:
         secondary_bone_axis="X",
         axis_forward=preset["axis_forward"],
         axis_up=preset["axis_up"],
-        bake_space_transform=True,
+        bake_space_transform=False,
         bake_anim=True,
         bake_anim_use_all_bones=True,
         bake_anim_use_nla_strips=False,
@@ -760,17 +814,37 @@ def main() -> None:
                               args.mixamo_prefix, args.print_bones)
 
     rename_objects(export_arm, meshes)
+
+    # ── Blender 5.x: 슬롯 기반 Action → 전통적 키프레임으로 bake ──
+    print("\n[Pre-export] Baking animation to traditional keyframes...")
+    bake_to_keyframes(export_arm, frame_start, frame_end)
+
     select_for_export(export_arm, meshes)
 
+    # ── 전체 FBX (Skeletal Mesh + Animation) ──
     try:
-        export_fbx(out_fbx, args.engine)
+        export_fbx(out_fbx, args.engine, anim_only=False)
     except Exception as e:
         print(f"FBX export error: {e}"); sys.exit(1)
 
+    # ── 애니메이션 전용 FBX (Skeleton + Animation만, 메시 없음) ──
+    anim_fbx = out_fbx.replace(".fbx", "_anim.fbx")
+    try:
+        # armature만 선택
+        bpy.ops.object.select_all(action="DESELECT")
+        export_arm.select_set(True)
+        bpy.context.view_layer.objects.active = export_arm
+        export_fbx(anim_fbx, args.engine, anim_only=True)
+    except Exception as e:
+        print(f"Animation-only FBX export error: {e}")
+
     print("=" * 60)
-    print(f"Done: {out_fbx}")
+    print(f"Done:")
+    print(f"  Full FBX : {out_fbx}")
+    print(f"  Anim FBX : {anim_fbx}")
     if not args.target_fbx:
         print("Note: name mapping fallback mode - use --target-fbx for full Mixamo compatibility.")
+    print("Tip: 언리얼에서 Anim FBX를 임포트하면 Animation Sequence로 인식됩니다.")
     print("=" * 60)
 
 
