@@ -244,29 +244,29 @@ def postprocess(
         else:
             smoothed_params[k] = val.copy()
 
-    print(f"[postprocess] Loading SMPL-X model: {model_path}")
-    smplx_model = smplx_lib.create(
-        str(model_path), model_type='smplx',
-        use_pca=False, batch_size=1,
-    )
+    # print(f"[postprocess] Loading SMPL-X model: {model_path}")
+    # smplx_model = smplx_lib.create(
+    #     str(model_path), model_type='smplx',
+    #     use_pca=False, batch_size=1,
+    # )
 
-    print("[postprocess] Computing raw FK for swing analysis...")
-    _, joints_raw = smplx_forward_chunked(smplx_model, raw_params, T, chunk=64)
+    # print("[postprocess] Computing raw FK for swing analysis...")
+    # _, joints_raw = smplx_forward_chunked(smplx_model, raw_params, T, chunk=64)
 
-    print("[postprocess] Analyzing swing phases...")
-    phases, stroke_types = classify_swing_phases(joints_raw, fps=fps, is_right_handed=True)
+    # print("[postprocess] Analyzing swing phases...")
+    # phases, stroke_types = classify_swing_phases(joints_raw, fps=fps, is_right_handed=True)
 
-    smoothed_params = fix_two_handed_grip_ik(smplx_model, smoothed_params, stroke_types, phases)
+    # smoothed_params = fix_two_handed_grip_ik(smplx_model, smoothed_params, stroke_types, phases)
 
-    print("[postprocess] Applying XPBD constraints...")
-    constrained_body_pose, total_violations = apply_xpbd_constraints(
-        smoothed_params['body_pose'],
-        fps=fps,
-        compliance=0.001,
-        num_iterations=8,
-        num_substeps=4,
-    )
-    smoothed_params['body_pose'] = constrained_body_pose
+    # print("[postprocess] Applying XPBD constraints...")
+    # constrained_body_pose, total_violations = apply_xpbd_constraints(
+    #     smoothed_params['body_pose'],
+    #     fps=fps,
+    #     compliance=0.001,
+    #     num_iterations=8,
+    #     num_substeps=4,
+    # )
+    # smoothed_params['body_pose'] = constrained_body_pose
 
     # 결과 저장
     output_npz.parent.mkdir(parents=True, exist_ok=True)
@@ -685,7 +685,7 @@ Examples:
     )
     parser.add_argument(
         "--naming",
-        choices=["mixamo", "unity"],
+        choices=["mixamo", "unity", "smplx"],
         default="mixamo",
         help="Bone naming convention (default: mixamo)",
     )

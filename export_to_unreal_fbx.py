@@ -3,6 +3,37 @@ import sys
 import os
 import numpy as np
 
+def _rotvec_to_mat3(rv):
+    angle = float(np.linalg.norm(rv))
+    if angle < 1e-8:
+        return np.eye(3, dtype=np.float64)
+    axis = rv / angle
+    K = np.array([[0, -axis[2], axis[1]],
+                  [axis[2], 0, -axis[0]],
+                  [-axis[1], axis[0], 0]], dtype=np.float64)
+    return np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K)
+
+def _mat3_to_rotvec(mat):
+    theta = np.arccos(np.clip((np.trace(mat) - 1.0) / 2.0, -1.0, 1.0))
+    if theta < 1e-8:
+        return np.zeros(3, dtype=np.float32)
+    if abs(theta - np.pi) < 1e-6:
+        RpI = mat + np.eye(3)
+        col = int(np.argmax(np.sum(RpI ** 2, axis=0)))
+        axis = RpI[:, col].copy()
+        axis /= np.linalg.norm(axis)
+        return (axis * theta).astype(np.float32)
+    denom = 2.0 * np.sin(theta)
+    axis = np.array([mat[2, 1] - mat[1, 2],
+                     mat[0, 2] - mat[2, 0],
+                     mat[1, 0] - mat[0, 1]], dtype=np.float64) / denom
+    return (axis * theta).astype(np.float32)
+
+# Y-up → Z-up: R_x(+90°), (x,y,z) → (x,-z,y)
+_R_Y2Z = np.array([[1.0, 0.0, 0.0],
+                    [0.0, 0.0, -1.0],
+                    [0.0, 1.0, 0.0]], dtype=np.float64)
+
 def convert_hmr_to_amass(input_npz, output_npz):
     data = np.load(input_npz, allow_pickle=True)
     
@@ -25,6 +56,15 @@ def convert_hmr_to_amass(input_npz, output_npz):
         betas = betas[0]
         
     gender = str(data['gender']) if 'gender' in data else 'neutral'
+
+    # ── Y-up → Z-up 좌표 변환 ──
+    trans = ((_R_Y2Z @ trans.astype(np.float64).T).T).astype(np.float32)
+    for i in range(N):
+        rv = poses[i, :3].astype(np.float64)
+        R_orig = _rotvec_to_mat3(rv)
+        R_new = _R_Y2Z @ R_orig
+        poses[i, :3] = _mat3_to_rotvec(R_new)
+    print(f"  [Y->Z] Converted {N} frames from Y-up to Z-up")
     
     np.savez(output_npz,
              poses=poses,
