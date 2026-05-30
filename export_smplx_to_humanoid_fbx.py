@@ -392,6 +392,31 @@ def apply_hand_keyframes(
         f"(sample: {next(iter(found_patterns.values()))})"
     )
 
+    # ── bone rest pose quaternion 미리 계산 ──────────────────────
+    # SMPLX axis-angle 회전은 parent 좌표계 기준이지만,
+    # Blender의 pose_bone.rotation_quaternion은 bone의 rest pose 기준이다.
+    # bone의 rest local rotation (parent 대비)을 보상해야 정확한 회전이 된다.
+    rest_quats: Dict[str, mathutils.Quaternion] = {}
+    for key, pbone in finger_bones.items():
+        bone = pbone.bone
+        if bone.parent:
+            rest_mat = bone.parent.matrix_local.inverted() @ bone.matrix_local
+        else:
+            rest_mat = bone.matrix_local
+        rest_quats[key] = rest_mat.to_quaternion()
+
+    # 디버그: rest quaternion이 identity가 아닌지 확인
+    sample_key = next(iter(rest_quats))
+    rq = rest_quats[sample_key]
+    is_identity = all(
+        abs(v) < 0.01 for v in [rq.w - 1.0, rq.x, rq.y, rq.z]
+    )
+    print(
+        f"  [Hand] Rest quat ({sample_key}): "
+        f"w={rq.w:.4f} x={rq.x:.4f} y={rq.y:.4f} z={rq.z:.4f}"
+        f"  {'(identity → no compensation needed)' if is_identity else '(non-trivial → applying compensation)'}"
+    )
+
     num_frames = min(N, frame_end - frame_start + 1)
 
     for frame_idx in range(num_frames):
@@ -408,14 +433,16 @@ def apply_hand_keyframes(
                 angle = float(np.linalg.norm(rv))
 
                 if angle < 1e-8:
-                    quat = mathutils.Quaternion((1.0, 0.0, 0.0, 0.0))
+                    smplx_quat = mathutils.Quaternion((1.0, 0.0, 0.0, 0.0))
                 else:
                     ax   = rv / angle
-                    quat = mathutils.Quaternion(
+                    smplx_quat = mathutils.Quaternion(
                         mathutils.Vector((ax[0], ax[1], ax[2])), angle
                     )
 
-                pbone.rotation_quaternion = quat
+                # SMPLX 회전(parent 좌표계) → Blender bone 로컬 좌표계로 변환
+                bone_rest = rest_quats[key]
+                pbone.rotation_quaternion = bone_rest.inverted() @ smplx_quat
                 pbone.keyframe_insert(data_path="rotation_quaternion", frame=frame)
 
         if frame_idx % 200 == 0:
