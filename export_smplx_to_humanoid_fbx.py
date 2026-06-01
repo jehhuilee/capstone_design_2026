@@ -11,10 +11,6 @@ import bpy
 import numpy as np
 import mathutils
 
-
-# ─────────────────────────────────────────────────────────────
-#  좌표계 변환 (Y-up SMPL-X → Z-up Blender/Unreal)
-# ─────────────────────────────────────────────────────────────
 _R_Y2Z = np.array(
     [[1.0,  0.0,  0.0],
      [0.0,  0.0, -1.0],
@@ -27,7 +23,6 @@ EXPORT_AXIS: Dict[str, Dict] = {
     "unity":  {"axis_forward": "-Z", "axis_up": "Y"},
 }
 
-# SMPL-X 손가락 관절 순서 (각 손 15개, AMASS poses 인덱스 순서)
 HAND_JOINT_NAMES: List[str] = [
     "index1",  "index2",  "index3",
     "middle1", "middle2", "middle3",
@@ -36,42 +31,28 @@ HAND_JOINT_NAMES: List[str] = [
     "thumb1",  "thumb2",  "thumb3",
 ]
 
-# SMPL-X Blender 애드온 버전별 손가락 뼈 이름 패턴
-# (버전마다 다르므로 여러 후보를 순서대로 시도)
 def _finger_name_candidates(side: str, joint: str) -> List[str]:
-    """
-    joint 예시: "index1", "middle2", "pinky3", "thumb1"
-    """
-    finger = re.sub(r"\d+$", "", joint)   # "index", "middle", ...
-    num    = re.sub(r"^\D+", "", joint)   # "1", "2", "3"
-    cap    = side.capitalize()            # "Left" / "Right"
-
-    # pinky = little 로도 표현됨
+    finger = re.sub(r"\d+$", "", joint)
+    num    = re.sub(r"^\D+", "", joint)
+    cap    = side.capitalize()
     little = "little" if finger == "pinky" else finger
 
     return [
-        # SMPL-X 공식 애드온 (대부분 이 패턴)
-        f"{side}_{finger}{num}",             # left_index1
-        f"{side}_{little}{num}",             # left_little1  (pinky 별칭)
-        # 일부 버전: _finger 접미사 포함
-        f"{side}_{finger}_finger{num}",      # left_index_finger1
-        f"{side}_{little}_finger{num}",      # left_little_finger1
-        # Mixamo 스타일로 미리 변환된 경우
-        f"{cap}Hand{finger.capitalize()}{num}",   # LeftHandIndex1
-        f"{cap}HandPinky{num}" if finger == "pinky" else "",  # LeftHandPinky1
-        # 짧은 접두사 스타일
+        f"{side}_{finger}{num}",
+        f"{side}_{finger}_{num}",
+        f"{side}_{little}{num}",
+        f"{side}_{little}_{num}",
+        f"{side}_{finger}_finger{num}",
+        f"{side}_{little}_finger{num}",
+        f"{cap}Hand{finger.capitalize()}{num}",
+        f"{cap}HandPinky{num}" if finger == "pinky" else "",
         f"L_{finger.capitalize()}{num}" if side == "left"  else "",
         f"R_{finger.capitalize()}{num}" if side == "right" else "",
     ]
 
-
-# ─────────────────────────────────────────────────────────────
-#  유틸리티
-# ─────────────────────────────────────────────────────────────
 def parse_args() -> argparse.Namespace:
     argv = sys.argv
     if "--" not in argv:
-        print("Usage: blender -b template.blend -P script.py -- input.npz [output_dir] [options]")
         sys.exit(1)
     raw = argv[argv.index("--") + 1:]
     p = argparse.ArgumentParser()
@@ -80,21 +61,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--engine",        choices=["unreal", "unity"], default="unreal")
     p.add_argument("--fps",           type=float, default=30.0)
     p.add_argument("--max-frames",    type=int,   default=0)
-    p.add_argument("--naming",        default="smplx")  # 호환성을 위해 추가
+    p.add_argument("--naming",        default="smplx")
     p.add_argument("--remove-shape-keys", action="store_true")
     p.add_argument("--keep-temp",     action="store_true")
     p.add_argument("--print-bones",   action="store_true")
     return p.parse_args(raw)
 
-
 def safe_makedirs(path: str) -> None:
     if path and not os.path.exists(path):
         os.makedirs(path)
 
-
 def obj_names() -> set:
     return {o.name for o in bpy.data.objects}
-
 
 def _rotvec_to_mat3(rv: np.ndarray) -> np.ndarray:
     angle = float(np.linalg.norm(rv))
@@ -108,7 +86,6 @@ def _rotvec_to_mat3(rv: np.ndarray) -> np.ndarray:
         dtype=np.float64,
     )
     return np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K)
-
 
 def _mat3_to_rotvec(mat: np.ndarray) -> np.ndarray:
     theta = np.arccos(np.clip((np.trace(mat) - 1.0) / 2.0, -1.0, 1.0))
@@ -129,10 +106,6 @@ def _mat3_to_rotvec(mat: np.ndarray) -> np.ndarray:
     ) / denom
     return (axis * theta).astype(np.float32)
 
-
-# ─────────────────────────────────────────────────────────────
-#  NPZ → AMASS 포맷 변환 (Y-up → Z-up 좌표 변환 포함)
-# ─────────────────────────────────────────────────────────────
 def convert_to_amass(src: str, dst: str, fps: float, max_frames: int) -> int:
     data = np.load(src, allow_pickle=True)
 
@@ -143,6 +116,13 @@ def convert_to_amass(src: str, dst: str, fps: float, max_frames: int) -> int:
             padded = np.zeros((N, 165), dtype=np.float32)
             padded[:, :poses.shape[1]] = poses
             poses = padded
+            
+            if "left_hand_pose" in data:
+                lh = np.asarray(data["left_hand_pose"], dtype=np.float32)
+                poses[:, 75:75 + min(lh.shape[1], 45)] = lh[:, :45]
+            if "right_hand_pose" in data:
+                rh = np.asarray(data["right_hand_pose"], dtype=np.float32)
+                poses[:, 120:120 + min(rh.shape[1], 45)] = rh[:, :45]
         else:
             poses = poses[:, :165]
     else:
@@ -174,7 +154,6 @@ def convert_to_amass(src: str, dst: str, fps: float, max_frames: int) -> int:
     else:
         N = poses.shape[0]
 
-    # Translation
     trans = np.zeros((N, 3), dtype=np.float32)
     for key in ("trans", "transl"):
         if key in data:
@@ -182,16 +161,11 @@ def convert_to_amass(src: str, dst: str, fps: float, max_frames: int) -> int:
             trans[: min(N, len(raw))] = raw[: min(N, len(raw))]
             break
 
-    # Y-up → Z-up 변환
-    # Translation: (x, y, z) → (x, -z, y)
     trans = ((_R_Y2Z @ trans.astype(np.float64).T).T).astype(np.float32)
 
-    # Global orient: R_new = R_y2z @ R_orig
     for i in range(N):
         rv = poses[i, :3].astype(np.float64)
         poses[i, :3] = _mat3_to_rotvec(_R_Y2Z @ _rotvec_to_mat3(rv))
-
-    print(f"  [Y→Z] {N} frames converted (Y-up → Z-up)")
 
     betas = (
         np.asarray(data["betas"], dtype=np.float32)
@@ -215,16 +189,11 @@ def convert_to_amass(src: str, dst: str, fps: float, max_frames: int) -> int:
     )
     return int(N)
 
-
-# ─────────────────────────────────────────────────────────────
-#  Blender 헬퍼
-# ─────────────────────────────────────────────────────────────
 def first_armature() -> Optional[bpy.types.Object]:
     for obj in bpy.context.scene.objects:
         if obj.type == "ARMATURE":
             return obj
     return None
-
 
 def find_anim_armature(before: set, fallback) -> Optional[bpy.types.Object]:
     new = [o for o in bpy.data.objects if o.type == "ARMATURE" and o.name not in before]
@@ -235,7 +204,6 @@ def find_anim_armature(before: set, fallback) -> Optional[bpy.types.Object]:
         if o.type == "ARMATURE" and o.animation_data and o.animation_data.action
     ]
     return animated[-1] if animated else fallback
-
 
 def meshes_of(arm: bpy.types.Object) -> List[bpy.types.Object]:
     seen, result = set(), []
@@ -255,7 +223,6 @@ def meshes_of(arm: bpy.types.Object) -> List[bpy.types.Object]:
                 break
     return result
 
-
 def set_frame_range(
     arm: bpy.types.Object, fps: float, fallback: int
 ) -> Tuple[int, int]:
@@ -267,9 +234,7 @@ def set_frame_range(
     bpy.context.scene.frame_start = start
     bpy.context.scene.frame_end   = end
     bpy.context.scene.frame_set(start)
-    print(f"Frame range: {start}-{end}  fps={fps}")
     return start, end
-
 
 def remove_shape_keys(mesh: bpy.types.Object) -> None:
     if mesh.type != "MESH" or not mesh.data.shape_keys:
@@ -279,12 +244,10 @@ def remove_shape_keys(mesh: bpy.types.Object) -> None:
     bpy.context.view_layer.objects.active = mesh
     try:
         bpy.ops.object.shape_key_remove(all=True)
-    except Exception as e:
-        print(f"shape_key_remove failed on {mesh.name}: {e}")
-
+    except Exception:
+        pass
 
 def get_all_fcurves(action) -> List:
-    """Blender 4.x / 5.x 모두 대응하는 fcurve 수집."""
     try:
         result = list(action.fcurves)
         if result:
@@ -327,11 +290,6 @@ def get_all_fcurves(action) -> List:
 
     return fcurves
 
-
-# ─────────────────────────────────────────────────────────────
-#  손가락 키프레임 삽입
-#  ※ bake_to_keyframes() 실행 후 적용해야 덮어써지지 않음!
-# ─────────────────────────────────────────────────────────────
 def apply_hand_keyframes(
     arm: bpy.types.Object,
     amass_npz_path: str,
@@ -339,12 +297,10 @@ def apply_hand_keyframes(
     frame_end: int,
 ) -> None:
     if not os.path.exists(amass_npz_path):
-        print(f"[Hand] NPZ not found: {amass_npz_path}")
         return
 
     data = np.load(amass_npz_path, allow_pickle=True)
     if "poses" not in data:
-        print("[Hand] 'poses' key not found, skipping hand keyframes")
         return
 
     poses = np.asarray(data["poses"], dtype=np.float64)
@@ -354,7 +310,6 @@ def apply_hand_keyframes(
     right_hand = poses[:, 120:165].reshape(N, 15, 3)
 
     if np.allclose(left_hand, 0.0) and np.allclose(right_hand, 0.0):
-        print("[Hand] All hand pose data is zero, skipping")
         return
 
     if bpy.context.mode != "OBJECT":
@@ -366,7 +321,6 @@ def apply_hand_keyframes(
 
     finger_bones: Dict[str, bpy.types.PoseBone] = {}
     found_patterns: Dict[str, str] = {}
-
     for side in ("left", "right"):
         for j, joint in enumerate(HAND_JOINT_NAMES):
             key = f"{side}_{joint}"
@@ -380,42 +334,67 @@ def apply_hand_keyframes(
                     found_patterns[key] = candidate
                     break
 
+    # 어떤 손가락 본이 매칭됐는지 stderr로 보고 (손가락이 안 나올 때 1차 점검용:
+    # 0/30이면 본 이름 불일치 → _finger_name_candidates 확인, 매칭되는데 이상하면 변환 문제)
+    matched = len(finger_bones)
+    sys.stderr.write(f"[hand] matched {matched}/30 finger bones\n")
+    if 0 < matched < 30:
+        missing = [
+            f"{s}_{j}"
+            for s in ("left", "right")
+            for j in HAND_JOINT_NAMES
+            if f"{s}_{j}" not in finger_bones
+        ]
+        sys.stderr.write(f"[hand] MISSING: {missing}\n")
+
     if not finger_bones:
-        print("[Hand] ❌ No finger bones found. Bone names in this armature:")
-        for b in arm.pose.bones:
-            print(f"    {b.name}")
+        sys.stderr.write(
+            "[hand] no finger bones matched — check armature bone names\n"
+        )
         bpy.ops.object.mode_set(mode="OBJECT")
         return
 
-    print(
-        f"[Hand] Found {len(finger_bones)}/30 finger bones "
-        f"(sample: {next(iter(found_patterns.values()))})"
-    )
+    # ── FIX 2: 이중 처리 제거 ──────────────────────────────────────────────
+    # smplx_add_animation(애드온)이 이미 손가락 포즈를 키프레임으로 넣고, bake가 그것을
+    # 구워둔 상태다. 손가락은 이 함수가 단독으로 책임지도록, 애드온/bake가 남긴 손가락
+    # 회전 fcurve(quaternion·euler·axis_angle 모두)를 먼저 깨끗이 지운 뒤 재적용한다.
+    # 매칭은 정확한 data_path로만 (부분 문자열 매칭의 index1↔index10 오제거 방지).
+    target_paths = set()
+    for name in found_patterns.values():
+        target_paths.add(f'pose.bones["{name}"].rotation_quaternion')
+        target_paths.add(f'pose.bones["{name}"].rotation_euler')
+        target_paths.add(f'pose.bones["{name}"].rotation_axis_angle')
 
-    # ── bone rest pose quaternion 미리 계산 ──────────────────────
-    # SMPLX axis-angle 회전은 parent 좌표계 기준이지만,
-    # Blender의 pose_bone.rotation_quaternion은 bone의 rest pose 기준이다.
-    # bone의 rest local rotation (parent 대비)을 보상해야 정확한 회전이 된다.
+    if arm.animation_data and arm.animation_data.action:
+        act = arm.animation_data.action
+        to_remove = [
+            fc for fc in get_all_fcurves(act) if fc.data_path in target_paths
+        ]
+        for fc in to_remove:
+            try:
+                act.fcurves.remove(fc)
+            except Exception:
+                pass
+
+    # ── FIX 1 (핵심): 손가락 굽힘축 좌표계 오류 수정 ────────────────────────
+    # pose_bone.rotation_quaternion(= matrix_basis)은 "본 자신의 로컬 좌표계"에서의
+    # 회전이다. SMPL hand_pose R_j는 SMPL-native(Y-up) 프레임의 부모-상대 회전이므로,
+    # 이를 본 로컬로 옮기려면  q = C⁻¹ · R_j · C  (C = 본의 rest) 로 conjugate한다.
+    # 단, R_j는 변환하지 않은 Y-up 회전이므로 C도 같은 native 프레임이어야 S가 상쇄된다.
+    #
+    # 애드온 버전마다 Y-up→Z-up 세우기를 (a) bone rest에 굽거나 (b) 오브젝트 회전으로
+    # 적용한다. 두 경우를 한 식으로 처리한다: 본의 "월드" rest = obj_rot · matrix_local
+    # 이고 native→world 회전은 항상 _R_Y2Z(=S)이므로,  C_native = S⁻¹ · obj_rot · matrix_local.
+    #   (a)일 때 obj_rot=I,  matrix_local=S·native → C_native=native ✓
+    #   (b)일 때 obj_rot=S,  matrix_local=native    → C_native=native ✓
+    S_inv = mathutils.Matrix(
+        ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, -1.0, 0.0))
+    ).to_quaternion()  # (_R_Y2Z)⁻¹ : Blender world(Z-up) → SMPL-native(Y-up)
+    obj_rot = arm.matrix_world.to_quaternion()
     rest_quats: Dict[str, mathutils.Quaternion] = {}
     for key, pbone in finger_bones.items():
-        bone = pbone.bone
-        if bone.parent:
-            rest_mat = bone.parent.matrix_local.inverted() @ bone.matrix_local
-        else:
-            rest_mat = bone.matrix_local
-        rest_quats[key] = rest_mat.to_quaternion()
-
-    # 디버그: rest quaternion이 identity가 아닌지 확인
-    sample_key = next(iter(rest_quats))
-    rq = rest_quats[sample_key]
-    is_identity = all(
-        abs(v) < 0.01 for v in [rq.w - 1.0, rq.x, rq.y, rq.z]
-    )
-    print(
-        f"  [Hand] Rest quat ({sample_key}): "
-        f"w={rq.w:.4f} x={rq.x:.4f} y={rq.y:.4f} z={rq.z:.4f}"
-        f"  {'(identity → no compensation needed)' if is_identity else '(non-trivial → applying compensation)'}"
-    )
+        rest_world = obj_rot @ pbone.bone.matrix_local.to_quaternion()
+        rest_quats[key] = S_inv @ rest_world
 
     num_frames = min(N, frame_end - frame_start + 1)
 
@@ -440,32 +419,12 @@ def apply_hand_keyframes(
                         mathutils.Vector((ax[0], ax[1], ax[2])), angle
                     )
 
-                # SMPLX 회전(parent 좌표계) → Blender bone 로컬 좌표계로 변환
                 bone_rest = rest_quats[key]
-                pbone.rotation_quaternion = bone_rest.inverted() @ smplx_quat
+                pbone.rotation_quaternion = bone_rest.inverted() @ smplx_quat @ bone_rest
                 pbone.keyframe_insert(data_path="rotation_quaternion", frame=frame)
-
-        if frame_idx % 200 == 0:
-            print(f"  [Hand] {frame_idx}/{num_frames}")
-
-    print(f"  [Hand] Done: {num_frames} frames")
-
-    if arm.animation_data and arm.animation_data.action:
-        finger_fc = sum(
-            1 for fc in get_all_fcurves(arm.animation_data.action)
-            if any(
-                kw in fc.data_path
-                for kw in ("index", "middle", "ring", "pinky", "thumb", "little")
-            )
-        )
-        print(f"  [Hand] Finger fcurves in action: {finger_fc}")
 
     bpy.ops.object.mode_set(mode="OBJECT")
 
-
-# ─────────────────────────────────────────────────────────────
-#  NLA Bake (Blender 5.x 슬롯 기반 Action → 전통 키프레임)
-# ─────────────────────────────────────────────────────────────
 def bake_to_keyframes(
     arm: bpy.types.Object,
     frame_start: int,
@@ -498,25 +457,9 @@ def bake_to_keyframes(
 
     bpy.ops.object.mode_set(mode="OBJECT")
 
-    if arm.animation_data and arm.animation_data.action:
-        act = arm.animation_data.action
-        try:
-            fc_count = len(list(act.fcurves))
-        except (AttributeError, TypeError):
-            fc_count = len(get_all_fcurves(act))
-        print(f"[Bake] action={act.name}, fcurves={fc_count}, range={frame_start}-{frame_end}")
-    else:
-        print("[Bake] WARNING: no action after bake")
-
-
-# ─────────────────────────────────────────────────────────────
-#  FBX 내보내기
-# ─────────────────────────────────────────────────────────────
 def export_fbx(path: str, engine: str, anim_only: bool = False) -> None:
     preset = EXPORT_AXIS[engine]
     obj_types = {"ARMATURE"} if anim_only else {"ARMATURE", "MESH"}
-    tag = "Anim-Only" if anim_only else "Full"
-    print(f"\n[FBX Export ({tag})] {path}  engine={engine}")
     bpy.ops.export_scene.fbx(
         filepath=path,
         use_selection=True,
@@ -544,7 +487,6 @@ def export_fbx(path: str, engine: str, anim_only: bool = False) -> None:
         embed_textures=False,
     )
 
-
 def select_for_export(
     arm: bpy.types.Object, meshes: List[bpy.types.Object]
 ) -> None:
@@ -553,7 +495,6 @@ def select_for_export(
     for m in meshes:
         m.select_set(True)
     bpy.context.view_layer.objects.active = arm
-
 
 def rename_objects(
     arm: bpy.types.Object, meshes: List[bpy.types.Object]
@@ -564,10 +505,6 @@ def rename_objects(
         mesh.name      = "SMPLXBody" if i == 0 else f"SMPLXMesh_{i:02d}"
         mesh.data.name = mesh.name + "Mesh"
 
-
-# ─────────────────────────────────────────────────────────────
-#  메인
-# ─────────────────────────────────────────────────────────────
 def main() -> None:
     args = parse_args()
 
@@ -579,36 +516,19 @@ def main() -> None:
     safe_makedirs(output_dir)
 
     base    = os.path.splitext(os.path.basename(input_npz))[0]
-    suffix  = EXPORT_AXIS[args.engine]["axis_up"].lower()
-    
-    # 🌟 수정: FBX 출력 이름을 원본 스크립트가 기대하는 형태(smplx_unreal)로 맞춤
     out_fbx = os.path.join(output_dir, f"{base}_smplx_unreal.fbx")
     tmp_npz = os.path.join(output_dir, f"{base}_amass_tmp.npz")
 
-    print("=" * 60)
-    print("SMPL-X → FBX Exporter (bone names preserved)")
-    print("=" * 60)
-    print(f"Input   : {input_npz}")
-    print(f"Output  : {out_fbx}")
-    print(f"Engine  : {args.engine}")
-    print("=" * 60)
-
     if not os.path.exists(input_npz):
-        print(f"Error: {input_npz} not found")
         sys.exit(1)
 
-    # ── 1. NPZ → AMASS 변환 ─────────────────────────────────────────────
     try:
         num_frames = convert_to_amass(input_npz, tmp_npz, args.fps, args.max_frames)
-        print(f"Frames: {num_frames}")
-    except Exception as e:
-        print(f"NPZ conversion error: {e}")
+    except Exception:
         sys.exit(1)
 
-    # ── 2. SMPL-X 애드온으로 애니메이션 로드 ────────────────────────────
     template_arm = first_armature()
     if template_arm is None:
-        print("Error: no armature in .blend file")
         sys.exit(1)
 
     before = obj_names()
@@ -618,28 +538,18 @@ def main() -> None:
 
     try:
         if not hasattr(bpy.ops.object, "smplx_add_animation"):
-            print("Error: SMPL-X Blender add-on not installed")
             sys.exit(1)
         bpy.ops.object.smplx_add_animation(filepath=tmp_npz, anim_format="AMASS")
-    except Exception as e:
-        print(f"smplx_add_animation error: {e}")
+    except Exception:
         sys.exit(1)
 
     src_arm = find_anim_armature(before, fallback=template_arm)
     if src_arm is None:
-        print("Error: animated armature not found")
         sys.exit(1)
 
     meshes = meshes_of(src_arm)
-    if not meshes:
-        print("Warning: no mesh found — skeleton-only FBX will be generated.")
 
     frame_start, frame_end = set_frame_range(src_arm, args.fps, num_frames)
-
-    if args.print_bones:
-        print("[Bones in armature]")
-        for b in src_arm.data.bones:
-            print(f"  {b.name}")
 
     if args.remove_shape_keys:
         for m in meshes:
@@ -647,48 +557,31 @@ def main() -> None:
 
     rename_objects(src_arm, meshes)
 
-    # ── 3. NLA Bake (Blender 5.x 슬롯 기반 Action 대응) ─────────────────
-    # 🌟 수정: 몸체 뼈를 먼저 전통적 프레임으로 굽습니다.
-    print("\n[Step 3] Baking animation to traditional keyframes...")
     bake_to_keyframes(src_arm, frame_start, frame_end)
 
-    # ── 4. 손가락 키프레임 삽입 (bake 이후!) ───────────────────────
-    # 🌟 수정: 굽기가 끝난 Action 위에 손가락을 삽입해야 덮어써지지 않고 유지됩니다.
-    print("\n[Step 4] Applying hand pose keyframes from NPZ...")
     apply_hand_keyframes(src_arm, tmp_npz, frame_start, frame_end)
 
-    # ── 5. tmp NPZ 정리 ──────────────────────────────────────────────────
     if os.path.exists(tmp_npz) and not args.keep_temp:
         try:
             os.remove(tmp_npz)
         except OSError:
             pass
 
-    # ── 6. FBX 내보내기 ──────────────────────────────────────────────────
     select_for_export(src_arm, meshes)
 
     try:
         export_fbx(out_fbx, args.engine, anim_only=False)
-    except Exception as e:
-        print(f"FBX export error: {e}")
+    except Exception:
         sys.exit(1)
 
-    # 애니메이션 전용 FBX (언리얼에서 Animation Sequence로 임포트할 때 사용)
     anim_fbx = out_fbx.replace(".fbx", "_anim.fbx")
     try:
         bpy.ops.object.select_all(action="DESELECT")
         src_arm.select_set(True)
         bpy.context.view_layer.objects.active = src_arm
         export_fbx(anim_fbx, args.engine, anim_only=True)
-    except Exception as e:
-        print(f"Animation-only FBX export error: {e}")
-
-    print("=" * 60)
-    print("Done:")
-    print(f"  Full FBX : {out_fbx}")
-    print(f"  Anim FBX : {anim_fbx}")
-    print("=" * 60)
-
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     main()

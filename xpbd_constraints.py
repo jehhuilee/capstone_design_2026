@@ -234,7 +234,7 @@ def apply_xpbd_constraints(body_poses, fps=30, compliance=0.001,
         num_iterations=num_iterations,
         num_substeps=num_substeps,
     )
-    constrained, violations = solver.solve_sequence(body_poses, fps)
+    constrained, violations = solver.solve_sequence(body_poses, fps) 
 
     total = violations.sum()
     print(f"   XPBD: 총 {total:.2f} rad 위반 보정 완료 "
