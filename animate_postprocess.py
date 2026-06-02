@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 from scipy.spatial.transform import Rotation as R
 
-from xpbd_constraints import apply_xpbd_constraints
+from rotation_postprocess import smooth_rotations, stabilize_body_pose
 from swing_classifier import (
     classify_swing_phases,
     PHASE_NAMES, STROKE_NAMES,
@@ -143,31 +143,24 @@ def run_animation(data_path=None, model_path=None, naming=None, visualize=True):
     raw_params      = {}
     smoothed_params = {}
 
-    # Step 1: One-Euro 필터
-    print("Step 1: One-Euro 필터 적용 중...")
+    # Step 1: 회전 후처리 — 연속성 → Savitzky-Golay 스무딩 → 각속도 클램핑.
+    #   (기존 One-Euro(Euler) 대체. Euler 기반은 짐벌락/언랩 불안정으로 트위스트 유발.)
+    #   body_pose는 추가로 스윙-트위스트 ROM(unwrap)으로 손목/팔뚝 과도 트위스트를 제한
+    #   → 기존 XPBD(Euler-XYZ 클램핑) 대체. 실측 비교(postprocess_lab)에서 최적 검증.
+    print("Step 1: 회전 후처리(연속성/SG/스윙-트위스트 ROM/각속도) 적용 중...")
     for k, v in params.items():
         val = v.numpy() if isinstance(v, torch.Tensor) else np.array(v)
         raw_params[k] = val
-        if k in rot_keys:
-            # body_pose 등은 (T, J, 3) 3D로, 나머지는 (T, J*3) 2D로 저장돼 있어
-            # 두 경우를 모두 (T, J, 3)으로 정규화한다 (-1 로 J 자동 계산).
+        if k == 'body_pose':
+            val_r = val.reshape(T, 21, 3)
+            smoothed_params[k] = stabilize_body_pose(val_r, fps=fps).reshape(T, -1)
+        elif k in rot_keys:
             val_r = val.reshape(T, -1, 3)
-            smoothed_params[k] = filter_rotations(val_r, fps).reshape(T, -1)
+            smoothed_params[k] = smooth_rotations(val_r, fps=fps).reshape(T, -1)
         elif k == 'transl':
             smoothed_params[k] = filter_translations(val, fps)
         else:
             smoothed_params[k] = val.copy()
-
-    # Step 2: XPBD 관절 제한
-    print("Step 2: XPBD 관절 제한 적용 중...")
-    constrained_body_pose, total_violations = apply_xpbd_constraints(
-        smoothed_params['body_pose'],
-        fps=fps,
-        compliance=0.001,
-        num_iterations=8,
-        num_substeps=4,
-    )
-    smoothed_params['body_pose'] = constrained_body_pose
 
     # ── SMPL-X 모델 로드 ─────────────────────────────────────
     print(f"SMPL-X 모델 로딩: {model_path}")
@@ -313,6 +306,8 @@ def run_animation(data_path=None, model_path=None, naming=None, visualize=True):
             pass
 
     print("시각화 종료.")
+    import os
+    os._exit(0)
 
 
 def parse_args():

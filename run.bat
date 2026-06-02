@@ -4,6 +4,7 @@ set PYTHONIOENCODING=utf-8
 echo Running post-processing pipeline...
 call venv\Scripts\activate
 python animate_postprocess.py "smplx_hmp_injected_full.pt" --naming smplx --visualize
+call deactivate
 
 echo Exporting to Unreal FBX (with finger retarget fix)...
 "C:\Program Files\Blender Foundation\Blender 5.1\blender.exe" -b smplx_template.blend -P export_to_unreal_fbx.py -- "Result\smplx_hmp_injected_full_postprocessed_smplx.npz" "Result"
